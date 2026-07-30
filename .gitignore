@@ -1,0 +1,28 @@
+# ---- 构建产物 ----
+build/
+release/
+*.3dsx
+*.elf
+*.cia
+*.smdh
+*.bnr
+*.map
+
+# ---- ffmpeg ----
+# 源码树 106MB、压缩包 11MB,都由 build-ffmpeg-3ds.sh 自动下载。
+# LGPL 要求的是「使用者有能力重新链接」—— 附构建脚本 + 版本号即满足,
+# 不需要把上游源码也塞进本仓库。
+ffmpeg-6.1.2/
+ffmpeg-*.tar.*
+
+# ---- 打包临时物 ----
+*.zip
+
+# ---- 系统垃圾 ----
+.DS_Store
+Thumbs.db
+
+# ---- 注意:下面这两个**要提交**,别加进来 ----
+# romfs/font.bcfnt   8MB,没有它界面全是 ?,别人 clone 下来编不出可用的程序
+# romfs/pinyin.dic   1MB,没有它拼音输入法退化成英文键盘
+# 它们是构建输入而不是构建产物。体积在 GitHub 的舒适区内(单文件 < 50MB)。

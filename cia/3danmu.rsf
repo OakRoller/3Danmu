@@ -1,0 +1,238 @@
+BasicInfo:
+  Title                   : 3Danmu
+  ProductCode             : CTR-P-3DAN
+  Logo                    : Homebrew
+
+RomFs:
+  # 【必须由 Makefile 用 -DAPP_ROMFS=绝对路径 传进来】
+  # 写相对路径 "romfs" 时,不同版本 makerom 的解析基准不一样(有的相对
+  # 工作目录,有的相对本文件所在目录 → cia/romfs 不存在却不报错),
+  # 结果 CIA 里没有 romfs:字体加载失败满屏"?"、拼音词库丢失。
+  # 3dsx 的 romfs 由 3dsxtool 附带,所以只有 CIA 中招。
+  RootPath: "$(APP_ROMFS)"
+
+TitleInfo:
+  Category                : Application
+  # 【UniqueId 故意不改】它是这个应用在系统里的身份证。改了的话,
+  # 新装的会被当成**另一个应用**,旧的那个还赖在主菜单里不走,
+  # 得手动去数据管理里删。名字里的品牌痕迹改掉就够了,
+  # 这个数字用户看不见。
+  UniqueId                : 0xB1B11
+
+Option:
+  UseOnSD                 : true
+  FreeProductCode         : true
+  MediaFootPadding        : false
+  EnableCrypt             : false
+  EnableCompress          : true
+
+AccessControlInfo:
+  CoreVersion                   : 2
+  DescVersion                   : 2
+  # 【硬解的硬性门槛:内核版本必须 >= 2.44】
+  # 3dbrew MVD_Services 原文:"the process must have kernel-release-version >=2.44"。
+  # 这里原本写的是 2.33(Old3DS 时代的内核),mvd 一看版本号就不干:
+  # mvdstdInit 能成功,但第一次 ProcessNALUnit 就在 mvd 进程内 svcBreak
+  # (自己断言失败)。特征是**和喂进去的数据完全无关** —— 换视频、换 NAL
+  # 长度(实测 31B / 34B / 12818B)、改喂法,崩溃点 PC 一个字节都不变。
+  # 数据无关的崩溃就别再往数据上找原因了,是环境不满足前置条件。
+  #
+  # .3dsx 经 Homebrew Launcher 启动时继承宿主的 exheader,版本号是够的,
+  # 所以这个坑只有 CIA 会踩。
+  ReleaseKernelMajor            : "02"
+  ReleaseKernelMinor            : "44"
+  UseExtSaveData                : false
+  FileSystemAccess:
+   - DirectSdmc
+   - DirectSdmcWrite
+  MemoryType                    : Application
+  SystemMode                    : 64MB
+  IdealProcessor                : 0
+  # 3 = 允许核心 0 和 1(不是 1!)。本程序是多线程跨核的:
+  # 下载线程跑核心 1,封面加载/评论/缓存扫描也各自指定了核心。
+  # 写成 1 等于只给核心 0,那些 threadCreate 全部失败 ——
+  # 表现是「列表正常、一点播放就卡住」,而且**一行日志都没有**,
+  # 因为卡在还没来得及打印的地方。
+  # .3dsx 走 Homebrew Launcher 时继承宿主的掩码,所以只有 CIA 会暴露。
+  AffinityMask                  : 3
+  Priority                      : 16
+  MaxCpu                        : 0xFF   # 与参考实现一致(硬解相关线程调度)
+  HandleTableSize               : 0x200
+  DisableDebug                  : false
+  EnableForceDebug              : false
+  CanWriteSharedPage            : true
+  CanUsePrivilegedPriority      : false
+  CanUseNonAlphabetAndNumber    : true
+  PermitMainFunctionArgument    : true
+  CanShareDeviceMemory          : true
+  RunnableOnSleep               : false
+  SpecialMemoryArrange          : true
+  # 【硬解相关的 New3DS 设置,和参考实现保持一致】
+  # 124MB 给的是扩展内存和 New3DS 独占模式,804MHz + L2 是解码性能所需。
+  #
+  # 注意:这几项**不**决定 linearAlloc 返回的地址窗口。New3DS 上线性内存
+  # 照样映射在 0x14xxxxxx,要给 mvd 用得自己调 osConvertOldLINEARMemToNew
+  # 转到 0x3xxxxxxx —— 那是代码里的事(见 player.c mvd_start)。
+  # 我一度看到 0x14xxxxxx 就断定"SystemModeExt 退回 Legacy 了",是错的。
+  #
+  # 另外曾因为"CIA 播放死机"把它改成 Legacy,同样是误判:真凶是下面
+  # Dependency 里漏了 mvd 模块(服务连不上、IPC 无限挂起)。
+  # 参考 Core-2-Extreme/Video_player_for_3DS 的配置,它也是 124MB。
+  SystemModeExt                 : 124MB
+  CpuSpeed                      : 804MHz
+  EnableL2Cache                 : true
+  CanAccessCore2                : true
+  IORegisterMapping:
+   - 1ff00000-1ff7ffff
+  MemoryMapping:
+   - 1f000000-1f5fffff:r
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    GetProcessIdealProcessor: 6
+    SetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadAffinityMask: 13
+    SetThreadAffinityMask: 14
+    GetThreadIdealProcessor: 15
+    SetThreadIdealProcessor: 16
+    GetCurrentProcessorNumber: 17
+    Run: 18
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    UnmapMemoryBlock: 32
+    CreateAddressArbiter: 33
+    ArbitrateAddress: 34
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    SignalAndWait: 38
+    DuplicateHandle: 39
+    GetSystemTick: 40
+    GetHandleInfo: 41
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+    ConnectToPort: 45
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
+    OpenProcess: 51
+    OpenThread: 52
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetThreadId: 55
+    GetResourceLimit: 56
+    GetResourceLimitLimitValues: 57
+    GetResourceLimitCurrentValues: 58
+    GetThreadContext: 59
+    Break: 60
+    OutputDebugString: 61
+    ControlPerformanceCounter: 62
+    CreatePort: 71
+    CreateSessionToPort: 72
+    CreateSession: 73
+    AcceptSession: 74
+    ReplyAndReceive1: 75
+    ReplyAndReceive2: 76
+    ReplyAndReceive3: 77
+    ReplyAndReceive4: 78
+    ReplyAndReceive: 79
+    BindInterrupt: 80
+    UnbindInterrupt: 81
+    InvalidateProcessDataCache: 82
+    StoreProcessDataCache: 83
+    FlushProcessDataCache: 84
+    StartInterProcessDma: 85
+    StopDma: 86
+    GetDmaState: 87
+    RestartDma: 88
+    SetHardwareBreakPoint: 108
+    QueryProcessMemory: 125
+  ServiceAccessControl:
+   - APT:U
+   - ac:u
+   - am:net
+   - cfg:u
+   - cfg:nor
+   - csnd:SND
+   - dsp::DSP
+   - fs:USER
+   - gsp::Gpu
+   - gsp::Lcd
+   - hid:USER
+   - http:C
+   - ir:rst
+   - ir:u
+   - ir:USER
+   - mic:u
+   # 服务名区分大小写:libctru 请求的是 "mvd:STD"(见其 mvd.c),
+   # 参考实现也只列大写这一条。ACL 上限 34 条,不浪费名额写小写变体。
+   - mvd:STD
+   - ndm:u
+   - news:s
+   - nwm::EXT
+   - nwm::UDS
+   - ptm:sysm
+   - ptm:u
+   - pxi:dev
+   - soc:U
+   - ssl:C
+   - y2r:u
+
+SystemControlInfo:
+  SaveDataSize: 0KB
+  RemasterVersion: 0
+  StackSize: 0x40000
+  Dependency:
+    ac: 0x0004013000002402
+    am: 0x0004013000001502
+    cfg: 0x0004013000001702
+    codec: 0x0004013000001802
+    csnd: 0x0004013000002702
+    dsp: 0x0004013000001a02
+    gpio: 0x0004013000001b02
+    gsp: 0x0004013000001c02
+    hid: 0x0004013000001d02
+    http: 0x0004013000002902
+    i2c: 0x0004013000001e02
+    ir: 0x0004013000003302
+    mcu: 0x0004013000001f02
+    mic: 0x0004013000002002
+    # 【CIA 硬解的关键】ServiceAccessControl 里的 mvd:STD 只是"允许连接",
+    # 而 mvd 是 New3DS 才加载的模块 —— **不在依赖表里声明,系统就不会
+    # 为本进程拉起它**,于是 srvGetServiceHandle 拿到一个死会话,
+    # 后续 IPC 发出去无人应答、无限挂起(svcSendSyncRequest 没有超时)。
+    # 症状:3dsx 一切正常(继承宿主的依赖),CIA 播放必卡死。
+    # 参考 Core-2-Extreme/Video_player_for_3DS(其 v1.2.0 修的正是这个)。
+    mvd: 0x0004013020004102
+    ndm: 0x0004013000002b02
+    nim: 0x0004013000002c02
+    nwm: 0x0004013000002d02
+    pdn: 0x0004013000002102
+    ps: 0x0004013000003102
+    ptm: 0x0004013000002202
+    ro: 0x0004013000003702
+    socket: 0x0004013000002e02
+    spi: 0x0004013000002302
+    ssl: 0x0004013000002f02
