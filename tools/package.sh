@@ -57,7 +57,7 @@ cp "$TARGET.3dsx" "$TARGET.cia" "$OUT/"
 cp README.md TESTING.md DEVELOPING.md LICENSE THIRD-PARTY-NOTICES.md "$OUT/"
 # licenses/ 整个目录必须进包 —— LGPL 和 OFL 要求的是「随二进制附上」,
 # 只放在源码仓库里不算数。
-cp -r licenses "$OUT/"
+cp -R licenses "$OUT/"
 
 # 注意:字体和词库**不单独放进包**,它们已经被 romfs 编进 .3dsx/.cia 了。
 # 但许可义务照样成立,所以上面那个 licenses/ 不能省。
@@ -82,21 +82,44 @@ cat > "$OUT/安装说明.txt" <<'TXT'
 仅供学习交流,严禁用于商业用途。
 TXT
 
+# 打包前先验暂存目录 —— 出问题时能分清是「没复制进来」还是「没打进包」。
+# 上一版就是没分清:自检报「zip 里没有」,而真凶可能在更早的复制那一步。
+[ -f "$OUT/licenses/LGPL-2.1.txt" ] || {
+    echo "!! licenses/ 没复制进 $OUT"; ls -la "$OUT"; exit 1; }
+
 BIN_ZIP="$ROOT/$TARGET-$VER-$DATE.zip"
+rm -f "$BIN_ZIP"          # zip 默认是**追加**,不删旧的会留下上次的残留
 ( cd release && zip -qr "$BIN_ZIP" "$(basename "$OUT")" )
 
 # ---------- 源码包 ----------
+# 【白名单,不是黑名单】上一版用的是「zip 整个目录再 -x 排除」,
+# 结果依赖当前目录名、父目录状态和 zip 对路径模式的解释 ——
+# 任何一环不对,掉东西是**静默**的(实测掉过 font.bcfnt 和整个 licenses/)。
+# 现在改成先复制到暂存目录:进包的东西是明确列出来的,漏了立刻看得见。
+#
 # ffmpeg 源码树不打进去(100MB+),build-ffmpeg-3ds.sh 会重新下载。
 # LGPL 要求的是「能重新链接」,附构建脚本 + 版本号即满足。
 SRC_ZIP="$ROOT/$TARGET-$VER-$DATE-src.zip"
+SRCDIR="release/src/$TARGET-$VER-$DATE"
 rm -f "$SRC_ZIP"
-( cd .. && zip -qr "$SRC_ZIP" "$(basename "$ROOT")" \
-    -x "$(basename "$ROOT")/build/*" \
-       "$(basename "$ROOT")/release/*" \
-       "$(basename "$ROOT")/.git/*" \
-       "$(basename "$ROOT")/ffmpeg-6.1.2/*" \
-       "$(basename "$ROOT")/ffmpeg-6.1.2.tar.xz" \
-       '*.3dsx' '*.elf' '*.smdh' '*.cia' '*.zip' '*.DS_Store' )
+mkdir -p "$SRCDIR"
+
+for f in README.md TESTING.md DEVELOPING.md LICENSE THIRD-PARTY-NOTICES.md \
+         Makefile build-ffmpeg-3ds.sh .gitignore "$TARGET.png"; do
+    [ -e "$f" ] && cp "$f" "$SRCDIR/"
+done
+for d in source romfs cia licenses tools test; do
+    [ -d "$d" ] && cp -R "$d" "$SRCDIR/"
+done
+# 暂存目录里可能混进构建残留(比如有人在 source/ 里编译过),清一遍
+find "$SRCDIR" \( -name '*.o' -o -name '*.d' -o -name '.DS_Store' \
+                 -o -name '*.3dsx' -o -name '*.elf' -o -name '*.cia' \
+                 -o -name '*.smdh' \) -delete 2>/dev/null || true
+
+[ -f "$SRCDIR/romfs/font.bcfnt" ] && [ -f "$SRCDIR/licenses/LGPL-2.1.txt" ] || {
+    echo "!! 源码暂存目录不完整:"; find "$SRCDIR" -maxdepth 2 | head -30; exit 1; }
+
+( cd "release/src" && zip -qr "$SRC_ZIP" "$(basename "$SRCDIR")" )
 
 # ---------- 出包自检 ----------
 # 排除规则是「黑名单」,写错一条不会报错,只会让包里悄悄少东西。
@@ -105,7 +128,12 @@ echo
 echo "==> 自检"
 fail=0
 chk() {  # chk <zip> <关键字> <说明>
-    if unzip -l "$1" | grep -q "$2"; then
+    # 别写成 unzip -l | grep -q:本脚本开了 pipefail,grep -q 提前退出会让
+    # unzip 吃到 SIGPIPE(141),于是文件明明在包里却报缺 —— 且只在匹配项
+    # 靠前时发生,看上去像「某些文件没打进去」。先整个读进变量。
+    local list
+    list=$(unzip -l "$1") || { echo "   !!   读不了 $(basename "$1")"; fail=1; return; }
+    if printf '%s\n' "$list" | grep -qF -- "$2"; then
         echo "   ok   $3"
     else
         echo "   缺!  $3   ($2 不在 $(basename "$1") 里)"
