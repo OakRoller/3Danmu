@@ -20,6 +20,7 @@
 
 #include "thumb.h"
 #include "net.h"
+#include "settings.h"   /* 缓存文件数存在这里,免得每次开机重扫 */
 #include "ui.h"   /* printf 要经 ui_printf 才进得了调试台环形缓冲 */
 
 #define THUMB_CACHE_DIR "sdmc:/3ds/3danmu/thumbs"
@@ -61,11 +62,6 @@ void thumb_notify_suspend(int on) {
 	 * 把连接掐掉。封面是尽力而为的,掐了下面会重来,不会永久少图。 */
 	if (s_suspend) net_cancel_img();
 }
-/* 缓存扫描线程单独一套开关。
- * 不能复用 s_quit —— 那个每次切列表都会被 thumb_stop 置位,而扫描
- * 整个运行期只该做一次,被打断就永远统计不出磁盘占用。 */
-static Thread s_scan_th = NULL;
-static volatile int s_scan_quit = 0;
 static volatile int s_next = 0;   /* 待领取的下一个槽(原子分发) */
 static int s_uploads_left = 1;   /* 每帧上传预算:防多张同帧同步传输造成卡顿 */
 /* 计时:整页封面到底慢在哪。req = 等网络(含锁),dec = 解码 + 缩放。
@@ -91,17 +87,7 @@ void thumb_init(void) {
 
 void thumb_exit(void) {
 	thumb_stop();
-	/* 缓存扫描线程要在这里收干净:它在做文件系统调用,而 main 返回后
-	 * 运行时会把文件系统拆掉。只在 thumb_exit 收,不在 thumb_stop 收 ——
-	 * 后者每次切列表都会调,扫描不该被打断 */
-	s_scan_quit = 1;
-	__dmb();
-	if (s_scan_th) {
-		if (R_FAILED(threadJoin(s_scan_th, 5000000000ULL)))
-			printf("thumb: cache scan join timeout\n");
-		threadFree(s_scan_th);
-		s_scan_th = NULL;
-	}
+	/* 缓存扫描线程已删除(见上面那段说明),这里不再需要收它 */
 	for (int i = 0; i < SLOTS; i++) {
 		if (s_stage[i]) { linearFree(s_stage[i]); s_stage[i] = NULL; }
 		if (s_tex_ok[i]) { C3D_TexDelete(&s_tex[i]); s_tex_ok[i] = false; }
@@ -139,53 +125,64 @@ static void cache_path(const char *url, char *out, size_t n) {
  * 又是额外的 SD 开销。按 2.3KB/张算,100MB 能存四万多张,
  * 真到那一步说明用了很久,清空重来完全可以接受。 */
 #define CACHE_MAX_BYTES (100u * 1024 * 1024)
+/* 一张缩略图的平均字节数(实测量级)。容量只用于「要不要清空」这个
+ * 粗判断,按张数估算足够 —— 精确到字节要付出每个文件一次 stat 的代价,
+ * 而那正是让扫描跑不完的原因。 */
+#define THUMB_AVG_BYTES 2400u
 static volatile u32 s_cache_bytes = 0;
+static volatile u32 s_cache_files = 0;
 static volatile int s_cache_scanned = 0;
 
-/* 遍历缓存目录统计总大小。**必须在独立线程里做,绝不能挂在下载路径上**。
+/* 【这里曾经有一个后台扫描线程,已删除 —— 别再加回来】
  *
- * 第一版是「第一次 cache_write 时顺手扫一遍」,结果:两个 loader 线程中,
- * 拿到 0 号槽的那个总是最先下载完、最先调 cache_write,于是**它被扫描
- * 卡住,另一个线程趁机把后面的图全拉完了** —— 表现为「第一张封面
- * 永远最后出来」,而且稳定复现。目录里文件越多卡得越久(要逐个 stat)。
+ * 它遍历整个缓存目录、逐个 stat 求精确占用。历史上为它改过两版:
+ * 先是从「cache_write 里顺手扫」挪到独立线程(那一版会把恰好第一个
+ * 调 cache_write 的 loader 卡住,表现为「第一张封面永远最后出来」),
+ * 后来又加了挂起让路和逐步歇息。
  *
- * 教训:任何「顺手做一下」的初始化,只要耗时不确定,就不能放在
- * 会被并发路径命中的地方 —— 它会把恰好第一个到达的那条路拖垮。 */
-static void cache_scan_thread(void *arg) {
-	(void)arg;
-	u32 total = 0;
-	DIR *d = opendir(THUMB_CACHE_DIR);
-	if (d) {
-		struct dirent *e;
-		char path[320];   /* d_name 上界 255,按接口上界给 */
-		while ((e = readdir(d)) != NULL) {
-			if (e->d_name[0] == '.') continue;
-			if (s_scan_quit) { closedir(d); return; }   /* 退出:立刻收手 */
-			snprintf(path, sizeof(path), THUMB_CACHE_DIR "/%s", e->d_name);
-			struct stat st;
-			if (stat(path, &st) == 0) total += (u32)st.st_size;
-		}
-		closedir(d);
-	}
-	s_cache_bytes = total;
-	__dmb();
-	s_cache_scanned = 2;      /* 2 = 扫完,容量上限从此生效 */
-	printf("thumb cache: %dKB on disk\n", (int)(total / 1024));
-}
+ * 但真正的问题是它**一次都没跑完过** —— trace 里从来没出现过
+ * 「扫描完成」。而 cache_write 的容量检查以「扫完」为前提,
+ * 所以那个 100MB 自动清空**从来没生效过**;它还顺带占满文件系统,
+ * 表现是「按 HOME 很卡,连 3DS 主界面都卡」,自家界面却一点事没有,
+ * 因此极难往这个方向想。
+ *
+ * 结论不是「把扫描优化得更快」,而是「不该有这次扫描」:
+ * 文件数在**写入侧**本来就知道,增量维护并存进 settings 即可。
+ * 首次升级清空一次缓存作为起点。
+ *
+ * 教训值得留着:一个从不完成的后台任务,比一个失败的任务更难发现 ——
+ * 它不报错,只是让依赖它的判断**永远处于未就绪**。 */
 
 /* 启动一次后台扫描(整个运行期只做一次) */
 static void cache_scan_kick(void) {
 	if (s_cache_scanned) return;
-	s_cache_scanned = 1;
-	static const int cores[] = { 3, 2, -2 };
-	/* 【必须可 join】以前这里建的是 detached 线程,退出时没人等它 ——
-	 * 按 START 退出后 main 返回、运行时把文件系统拆掉,而它还卡在
-	 * readdir/stat 里,于是 data abort(读 NULL+0x44,core 3)。
-	 * detached 的含义只是"不用 threadFree",不是"可以不等它结束"。 */
-	for (int i = 0; i < 3 && !s_scan_th; i++)
-		s_scan_th = threadCreate(cache_scan_thread, NULL, 16 * 1024, 0x3B,
-		                         cores[i], false);
-	if (!s_scan_th) s_cache_scanned = 2;   /* 建不了就当扫过(容量按 0 起算) */
+	/* 【上次的结果直接用,不重扫】
+	 * 缓存内容只有我们自己会改,所以文件数可以增量维护,没必要每次开机
+	 * 重新数一遍。存的是文件数而不是字节数:字节数要 stat 才知道,
+	 * 而文件数在写入/清空时我们本来就知道。 */
+	int saved = settings_get("thumb_files", -1);
+	if (saved >= 0) {
+		s_cache_files = (u32)saved;
+		s_cache_bytes = s_cache_files * THUMB_AVG_BYTES;
+		s_cache_scanned = 2;
+		return;
+	}
+
+	/* 【首次升级:从 0 起算,一个磁盘操作都不做】
+	 *
+	 * 这里**绝不能扫盘,也绝不能清盘**。cache_scan_kick 是从主线程的
+	 * thumb_init 调的,而缓存目录里可能有几万个文件 —— 无论遍历还是删除,
+	 * 耗时都不可控,放在这儿就是把界面钉死(实测:卡在"加载中"不动)。
+	 * 上一版就是在这里调 thumb_cache_clear 翻的车。
+	 *
+	 * 已经在盘上的那些文件不计入,计数从 0 开始往上加。后果只是容量上限
+	 * 来得比预期晚一些 —— 而一旦触发,thumb_cache_clear 会把新旧一起清掉,
+	 * 于是自动回到准确状态。用「暂时不准但自愈」换「永不阻塞」,值。 */
+	s_cache_files = 0;
+	s_cache_bytes = 0;
+	s_cache_scanned = 2;      /* 已知(为 0),不是"扫描中" */
+	settings_set("thumb_files", 0);
+	printf("thumb: cache count starts at 0 (see thumb.c)\n");
 }
 
 void thumb_cache_clear(void) {
@@ -201,7 +198,9 @@ void thumb_cache_clear(void) {
 		closedir(d);
 	}
 	s_cache_bytes = 0;
+	s_cache_files = 0;
 	s_cache_scanned = 2;   /* 刚清空,总量确定为 0 —— 是「已知」而非「扫描中」 */
+	settings_set("thumb_files", 0);
 	printf("thumb cache cleared\n");
 }
 
@@ -235,8 +234,15 @@ static void cache_write(const char *url, const u8 *data, size_t len) {
 	cache_path(url, path, sizeof(path));
 	FILE *f = fopen(path, "wb");
 	if (!f) return;
-	if (fwrite(data, 1, len, f) == len)
+	if (fwrite(data, 1, len, f) == len) {
 		__sync_fetch_and_add(&s_cache_bytes, (u32)len);
+		u32 n = __sync_add_and_fetch(&s_cache_files, 1);
+		/* 【别每张都落盘】settings_set 是当场写文件的,而这里是下载线程,
+		 * 每张封面写一次 settings.txt 等于又回到"拿 SD 卡开销换精度"。
+		 * 每 32 张记一次:最坏丢 31 张的计数,对一个 100MB 的粗略上限
+		 * 完全无所谓。 */
+		if ((n & 31) == 0) settings_set("thumb_files", (int)n);
+	}
 	fclose(f);
 }
 

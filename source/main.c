@@ -66,7 +66,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.0.1"
+#define APP_VERSION "1.0.2"
 
 /* ---------- 分 P ----------
  * 200 是务实的上限:课程/合集偶尔上百 P,再多就不该在掌机上翻了。
@@ -719,8 +719,10 @@ static void play_stream(BiliVideo *v, int64_t cid, const char *disp_title) {
 	 * 其它请求都收摊之后,由播放器单独去拉(player.c 里 sub_kicked) */
 	sub_free();   /* 先清干净,杜绝上一个视频的残留 */
 	int used_qn = g_qn;
-	int r = bili_get_play_url(v->bvid, cid, g_qn, url, sizeof(url));
-	ui_trace("playurl r=%d", r);
+  int r = bili_get_play_url(v->bvid, cid, g_qn, url, sizeof(url));
+	/* 带上原因:光看 r=-1 分不出「没发请求」「请求失败」「接口拒绝」,
+	 * 而这三者的修法完全不同 */
+	ui_trace("playurl r=%d err=%s", r, bili_last_error());
 	if (r != 0 && g_qn != 16) { /* 高清晰度拿不到就回落 360P */
 		printf("qn=%d failed, fallback to 360P\n", g_qn);
 		r = bili_get_play_url(v->bvid, cid, 16, url, sizeof(url));
@@ -847,6 +849,15 @@ static void apt_hook_cb(APT_HookType hook, void *param) {
 }
 
 int main(void) {
+	/* 界面本来就该跑在满速上,不必等到播视频才提。Old3DS 上是空操作。
+	 *
+	 * 【别顺手在这儿加 APT_SetAppCpuTimeLimit】曾经加过,理由是「启动后
+	 * 到第一次播放之前界面很卡」。后来实测证明**那个理由是错的** ——
+	 * 用固定计算量了一把,播放前后耗时完全一样,主频从头到尾没变过。
+	 * 真凶是封面缓存扫描线程在猛敲文件系统(见 thumb.c)。
+	 * 而 SetAppCpuTimeLimit 是给「应用要用系统核」用的,常驻着反而可能
+	 * 挤占 HOME 菜单所在的那个核心 —— 它留在 play_stream 里就够了。 */
+	osSetSpeedupEnable(true);
 	ui_init();
 	/* HOME/睡眠钩子:挂起时暂停播放。不挂这个钩子的话,按 HOME 后
 	 * 下载和解码线程照跑,HOME 菜单卡、回来更卡 */

@@ -325,6 +325,8 @@ static void downloader_main(void *arg) {
 	}
 	if (p->ns.size) r->total = p->ns.size;
 
+	u64 last_read_ms = osGetTime();   /* 上次真正从 socket 读到东西的时刻 */
+	int stall_count = 0;              /* 本次播放累计断线次数 */
 	while (!r->quit) {
 		if (r->seek_req) {
 			if (ns_seek(&p->ns, r->seek_target) != 0) {
@@ -342,6 +344,9 @@ static void downloader_main(void *arg) {
 		u32 used = r->wr - r->rd;
 		u32 space = RING_CAP - used;
 		if (space < 4096 || r->eof || r->err) {
+			/* 缓冲满了就不读 socket —— 这正是可疑之处:稳定播放时环形缓冲
+			 * 长期是满的,连接一直闲着,CDN 到点就把它关了。那样的"断线"
+			 * 是我们自己造成的,不是网络有问题。idle_ms 就是用来分辨这个的。 */
 			svcSleepThread(2 * 1000 * 1000LL);
 			continue;
 		}
@@ -353,6 +358,7 @@ static void downloader_main(void *arg) {
 		if (n > 0) {
 			__dmb();
 			r->wr += (u32)n;
+			last_read_ms = osGetTime();
 		} else {
 			/* 读到 0 且已到文件末尾 = 真 EOF;否则当断线处理 */
 			u64 wpos = r->base + r->wr;
@@ -363,6 +369,17 @@ static void downloader_main(void *arg) {
 				/* 断线:后台无限重连(退避 0.5s→3s 封顶),
 				 * 缓冲吃完时播放会自然停住,连上即自动续播;B 退出不受影响 */
 				int attempt = 0;
+				/* 【这一行是用来定性的】
+				 * idle 大(几十秒)+ 缓冲当时是满的 → 是我们自己闲出来的,
+				 *   服务端按空闲超时关的连接,不是网络有问题
+				 * idle 小(几百毫秒)→ 真的断了,该去看 Wi-Fi
+				 * n<0 是出错,n==0 是对端正常关闭 —— 后者更像空闲超时 */
+				stall_count++;
+				u64 idle = osGetTime() - last_read_ms;
+				ui_trace("net 断开#%d: n=%ld idle=%dms 缓冲=%dKB/%dKB pos=%d%%",
+				         stall_count, n, (int)idle,
+				         (int)((r->wr - r->rd) / 1024), RING_CAP / 1024,
+				         r->total ? (int)(wpos * 100 / r->total) : -1);
 				/* net_is_shutting_down():系统正在关闭本程序。此时重连是
 				 * 白费力气(所有请求都会被立刻拒绝),而这个循环最长要
 				 * 3 秒一轮地转下去,退出就卡在这儿了。 */
@@ -379,10 +396,18 @@ static void downloader_main(void *arg) {
 					attempt++;
 					if (attempt <= 3 || attempt % 10 == 0)
 						printf("net stall, retry #%d...\n", attempt);
+					u64 t0 = osGetTime();
 					if (ns_seek(&p->ns, wpos) == 0) {
-						printf("reconnected\n");
+						ui_trace("net 重连成功: 第%d次尝试, 耗时%dms",
+						         attempt, (int)(osGetTime() - t0));
+						last_read_ms = osGetTime();
 						break;
 					}
+					/* 重连**失败**才是真正要查的东西 —— 提示要显示出来,
+					 * 得连续失败两次以上。只记前几次,别刷屏 */
+					if (attempt <= 5)
+						ui_trace("net 重连失败: 第%d次, 耗时%dms",
+						         attempt, (int)(osGetTime() - t0));
 				}
 				p->net_stall = 0;
 			}
@@ -2192,11 +2217,25 @@ static int player_play_inner(const char *url, const char *title) {
 		 * (或超时 4 秒)才交还给时钟。挡住一切残余的短暂回跳 */
 		double seek_latch = -1.0;
 		u64 seek_latch_t0 = 0;
-		/* 「缓冲中」的去抖起点(0 = 当前不处于卡顿)。
-		 * p->buffering 是按音频缓冲余量算的,正常播放时也会零星置位几十毫秒。
-		 * 直接照着它画,提示就会在流畅播放中一闪一闪 —— 用户看到的是
-		 * 「一直在缓冲」,实际画面根本没停。所以要卡住持续时间再说。 */
-		u64 stall_t0 = 0;
+		/* 【提示的判据是「画面停没停」,不是任何内部状态】
+		 * 曾经照着 p->buffering / p->net_stall 画,两个都错:
+		 * 它们说的是「内部正在处理什么」,而用户在意的只有一件事 ——
+		 * 画面还走不走。断线了但缓冲够用、画面照常播,屏幕中央就不该
+		 * 弹任何东西;反过来画面真停了,才需要解释一句。
+		 * 所以只看播放时钟有没有前进。 */
+		u32 last_clock_ms_seen = 0xFFFFFFFFu;
+		u64 last_clock_move = 0;
+
+		/* 【进播放器先清挂起请求】
+		 * s_suspend_req 由 APT 钩子置位,但**只有这个循环会消费它**。
+		 * 在列表页按 HOME、或者启动时系统发的挂起事件,都会把它置上并一直留着,
+		 * 于是下一次播放一进来就把自己暂停 —— 表现是「每次开程序后第一个视频
+		 * 不自动播,第二个才正常」,而且看上去完全不像 HOME 键的问题。
+		 *
+		 * 挂起发生在播放开始**之前**,对这次播放毫无意义:那时根本没在播。
+		 * 这和代码里另一处的教训是同一条 —— 陈旧的异步请求不能活到
+		 * 它不再有意义的上下文里。 */
+		s_suspend_req = 0;
 		double last_clock_dbg = -1.0;
 		u64 last_report = 0;         /* 观看历史上报节流 */
 		/* 上报线程:主线程只置标志,网络请求不许出现在渲染循环里 */
@@ -2409,19 +2448,24 @@ static int player_play_inner(const char *url, const char *title) {
 				 * 显示条件除了 buffering 还加了「首帧还没出过」:
 				 * 开播头几秒 buffering 可能尚未置位,而屏幕全黑 ——
 				 * 黑屏没有任何字,和死机没法区分,这正是被报过的观感 bug。 */
-				/* 【去抖】只有真卡住了才提示。
-				 * 判据要的是「持续了多久」,不是「此刻是不是」——
-				 * p->buffering 按音频缓冲余量算,正常播放中也会零星置位
-				 * 几十毫秒,照着它画就是一闪一闪的假警报,用户看到的是
-				 * 「一直在缓冲」,而画面其实一秒都没停。
-				 * 起播黑屏(dbg_decoded==0)和断线重连门槛更低:
-				 * 那两种情况屏幕上本来就没东西,迟迟不出字和死机没法区分。 */
-				bool stalling = (p->buffering || p->net_stall ||
-				                 p->dbg_decoded == 0) && !p->pause;
-				if (!stalling) stall_t0 = 0;
-				else if (!stall_t0) stall_t0 = osGetTime();
-				u32 hold_ms = (p->dbg_decoded == 0 || p->net_stall) ? 250 : 700;
-				if (stall_t0 && osGetTime() - stall_t0 >= hold_ms) {
+				/* 【只在画面真的停了时才提示】
+				 * 时钟一直在走 = 画面在播 = 用户没被打扰,哪怕后台正在
+				 * 断线重连。断线本身不值得打断观看,缓冲盖得住就当没发生。
+				 *
+				 * 门槛分两档:起播还没出过帧时屏幕是全黑的,黑屏不出字
+				 * 和死机没法区分,所以早一点;正在播的片子停一下则要等久些,
+				 * 免得为几百毫秒的抖动闪一下提示。 */
+				u32 cms = p->clock_ms;
+				/* 暂停期间时钟本来就不走,时间戳要跟着推 ——
+				 * 否则一恢复播放就"已经停了很久",立刻闪一下提示 */
+				if (cms != last_clock_ms_seen || p->pause) {
+					last_clock_ms_seen = cms;
+					last_clock_move = osGetTime();
+				}
+				u32 hold_ms = (p->dbg_decoded == 0) ? 400 : 1200;
+				bool frozen = !p->pause && last_clock_move &&
+				              osGetTime() - last_clock_move >= hold_ms;
+				if (frozen) {
 					bool waiting_dm = s_pref_danmaku && dm_loading();
 					static const char *dots[4] = { "", ".", "..", "..." };
 					char buf[48];
@@ -2788,7 +2832,15 @@ static int player_play_inner(const char *url, const char *title) {
 				}
 				/* 保持暂停,由用户决定何时继续 */
 			}
-			if (do_pause) p->pause = !p->pause;
+			if (do_pause) {
+				p->pause = !p->pause;
+				/* 记一行:暂停状态莫名其妙时,光看现象分不出是用户按的、
+				 * 触屏按钮点的,还是 HOME 挂起请求引起的 */
+				/* u32 在 devkitARM 上是 unsigned long,要 %lu */
+				ui_trace("player: %s (clock=%lums)",
+				         p->pause ? "暂停" : "继续",
+				         (unsigned long)p->clock_ms);
+			}
 			if (p->worker_done) { ret = p->ret; break; }
 		}
 

@@ -1380,8 +1380,13 @@ int bili_get_play_url(const char *bvid, int64_t cid, int qn, char *url_out, size
 	char *body = NULL;
 	Json *j = NULL;
 
+	/* 每一级都留声。三级方案里任何一级"没走"和"走了没成"表现一样(都是往下掉),
+	 * 事后只看最终返回值分不出是哪一级出的问题,更分不出有没有真的发过请求 */
+	u64 t_enter = osGetTime();
+
 	/* 1) 标准 web 端 WBI 签名接口,fnval=1 要 durl mp4(登录后 360P/480P 可用) */
 	bool is_av = (bvid[0] == 'a' && bvid[1] == 'v');
+	if (!s_mixin[0]) ui_trace("playurl: 无 WBI key,先取 nav");
 	if (s_mixin[0] || fetch_nav() == 0) {
 		const char *keys[] = { is_av ? "avid" : "bvid", "cid", "qn", "fnval", "fnver", "fourk" };
 		const char *vals[] = { is_av ? bvid + 2 : bvid, cidstr, qnstr, "1", "0", "0" };
@@ -1389,16 +1394,24 @@ int bili_get_play_url(const char *bvid, int64_t cid, int qn, char *url_out, size
 		if (wbi_sign(keys, vals, 6, s_mixin, net_now(), query, sizeof(query)) == 0) {
 			snprintf(url, sizeof(url),
 			         "https://api.bilibili.com/x/player/wbi/playurl?%s", query);
+			u64 t0 = osGetTime();
 			j = api_get(url, &body);
+			ui_trace("playurl 一级(wbi): %s %dms %s", j ? "有响应" : "失败",
+			         (int)(osGetTime() - t0), j ? "" : s_last_err);
 			if (j) {
 				bool ok = extract_durl(j, url_out, urllen);
 				json_free(j);
 				free(body);
 				if (ok) return 0;
+				ui_trace("playurl 一级: 响应里没有可用 durl");
 			} else {
 				s_mixin[0] = 0; /* 签名 key 可能过期,下次重取 */
 			}
+		} else {
+			ui_trace("playurl 一级: wbi 签名失败(跳过,未发请求)");
 		}
+	} else {
+		ui_trace("playurl 一级: 无 WBI key 且 nav 也失败(跳过,未发请求)");
 	}
 
 	/* 2) 退回 html5 免登录接口 */
@@ -1409,18 +1422,28 @@ int bili_get_play_url(const char *bvid, int64_t cid, int qn, char *url_out, size
 	         is_av ? "avid" : "bvid", is_av ? bvid + 2 : bvid, cidstr, qn);
 	printf("GET %.90s\n", url);
 	body = NULL;
-	j = api_get(url, &body);
+	{
+		u64 t0 = osGetTime();
+		j = api_get(url, &body);
+		ui_trace("playurl 二级(html5): %s %dms %s", j ? "有响应" : "失败",
+		         (int)(osGetTime() - t0), j ? "" : s_last_err);
+	}
 	if (j) {
 		bool ok = extract_durl(j, url_out, urllen);
 		json_free(j);
 		free(body);
 		if (ok) return 0;
+		ui_trace("playurl 二级: 响应里没有可用 durl");
 	}
 
 	/* 3) App 端 appkey 签名接口:web 端风控放不过的视频走这里
 	 *(与搜索/cid 兜底同一套 appkey,已验证能过)。只吃 aid,
 	 * bvid 形式没有 aid 可用就到此为止 */
-	if (!is_av) return -1;
+	if (!is_av) {
+		ui_trace("playurl: BV 号,三级方案不适用,放弃(共 %dms)",
+		         (int)(osGetTime() - t_enter));
+		return -1;
+	}
 	printf("html5 playurl failed, trying app playurl...\n");
 	{
 		char ts[16];
