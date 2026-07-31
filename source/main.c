@@ -68,6 +68,14 @@ static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
 #define APP_VERSION "1.0.1"
 
+/* ---------- 分 P ----------
+ * 200 是务实的上限:课程/合集偶尔上百 P,再多就不该在掌机上翻了。
+ * 放文件作用域而不是栈上——一条 BiliPage 约 112 字节,200 条 22KB,
+ * 而这条调用链底下还压着整个播放器。 */
+#define MAX_PAGES 200
+static BiliPage s_pages[MAX_PAGES];
+static int s_npages = 0;
+
 static bool g_danmaku = true;       /* 设置:弹幕开关 */
 static int  g_qn = 16;              /* 设置:清晰度 16=360P 32=480P */
 static bool g_force_sw = false;     /* 设置:强制软解 */
@@ -539,6 +547,208 @@ static bool login_cb(void) {
 	return bili_logged_in();
 }
 
+/* 分P 一行的显示文本:"P3  标题"(没标题就只有 "P3") */
+static void page_label(const BiliPage *pg, char *out, size_t n) {
+	if (pg->title[0]) snprintf(out, n, "P%d  %s", pg->page, pg->title);
+	else              snprintf(out, n, "P%d", pg->page);
+}
+
+/* 分P 选择页:上屏放视频标题 + 当前选中项,下屏是可直接点的列表。
+ * 返回选中的下标;-1 = 放弃(B / 返回按钮 / 系统要关程序)。
+ *
+ * 【为什么是开播前的独立一页,而不是播放器里的一个按钮】
+ * 播放器主循环已经有五个子页面共用同一套触控状态和退出路径,再塞一个
+ * 带滚动的列表进去,那几条路径都要跟着分叉 —— 而退出路径正是这个工程
+ * 修得最久的一块。何况"看哪一集"本来就是开播**之前**的决定;
+ * 看完一 P 回到这一页接着挑,也比在播放中翻列表顺手。 */
+static int choose_page(const BiliVideo *v, int cur) {
+	if (s_npages <= 0) return -1;
+	const float ROWH = 34.0f;
+	const int   VIS  = 5;                   /* 下屏一次显示 5 行 */
+	int sel = (cur >= 0 && cur < s_npages) ? cur : 0;
+	int first = sel - VIS / 2;
+	if (first > s_npages - VIS) first = s_npages - VIS;
+	if (first < 0) first = 0;
+
+	while (aptMainLoop()) {
+		/* 一帧只能 scan 一次(scan 两次会吃掉触摸的按下沿,
+		 * 表现是下屏点不动)——和登录页同一个坑 */
+		hidScanInput();
+		u32 kd = hidKeysDown();
+		touchPosition tp = { 0, 0 };
+		bool touched = (kd & KEY_TOUCH) != 0;
+		if (touched) hidTouchRead(&tp);
+
+		if (kd & KEY_B) return -1;
+		if ((kd & KEY_DOWN) && sel + 1 < s_npages) sel++;
+		if ((kd & KEY_UP)   && sel > 0)            sel--;
+		if (kd & KEY_R) sel += VIS;
+		if (kd & KEY_L) sel -= VIS;
+		if (sel < 0) sel = 0;
+		if (sel >= s_npages) sel = s_npages - 1;
+		if (kd & KEY_A) return sel;
+
+		/* 视口贴边才滚,不是每次都把选中项居中 —— 居中会让上下键
+		 * 时整页一直在动,反而看不出自己走到哪了 */
+		if (sel < first) first = sel;
+		if (sel >= first + VIS) first = sel - VIS + 1;
+		if (first > s_npages - VIS) first = s_npages - VIS;
+		if (first < 0) first = 0;
+
+		/* 和播放/搜索/登录里的子循环一样:系统要关我们时**不能再画帧**,
+		 * ui_end 要等的 VBlank 在退出态可能永远不来(见主循环的说明) */
+		if (net_is_shutting_down() || aptShouldClose()) return -1;
+
+		int picked = -1;
+		float th = ui_text_height(UI_SHARP);
+
+		ui_begin();
+		ui_rect_z(0, 0, 0.6f, 400, 26, UI_COL_ACCENT);
+		ui_text_clipped_z(6, 3, 0.7f, UI_SHARP, UI_COL_WHITE, v->title, 388);
+		{
+			float y = 42.0f;
+			char buf[64];
+			snprintf(buf, sizeof(buf), "共 %d 个分P", s_npages);
+			ui_text(16, y, UI_SHARP, UI_COL_DIM, buf);
+			y += th + 12.0f;
+			char lb[160];
+			page_label(&s_pages[sel], lb, sizeof(lb));
+			ui_rect(16, y - 5, 368, th + 10, UI_COL_SEL);
+			ui_rect(16, y - 5, 3, th + 10, UI_COL_ACCENT);
+			ui_text_clipped(26, y, UI_SHARP, UI_COL_WHITE, lb, 350);
+			y += th + 22.0f;
+			if (s_pages[sel].duration > 0) {
+				snprintf(buf, sizeof(buf), "时长 %d:%02d",
+				         s_pages[sel].duration / 60,
+				         s_pages[sel].duration % 60);
+				ui_text(16, y, UI_SHARP, UI_COL_DIM, buf);
+			}
+			/* 上一次开播失败的原因(取流失败/需登录…)。play_stream 成功时
+			 * 会把 s_busy 清掉,所以这里有字就一定是刚才那次没播成 ——
+			 * 不显示的话,用户点了一下又回到这一页,看着像"没反应" */
+			if (s_busy[0])
+				ui_text_clipped(16, 190, UI_SHARP, UI_COL_ACCENT,
+				                s_busy, 368);
+			ui_text(16, 214, UI_SHARP, UI_COL_DIM,
+			        "十字键选择  A 播放  L/R 翻页  B 返回");
+		}
+
+		if (!ui_console_active()) {
+			ui_begin_bottom();
+			ui_rect(0, 0, 320, 22, UI_COL_ACCENT);
+			char hdr[64];
+			snprintf(hdr, sizeof(hdr), "选集  %d/%d", sel + 1, s_npages);
+			ui_text(8, (22.0f - th) / 2.0f, UI_SHARP, UI_COL_WHITE, hdr);
+			for (int k = 0; k < VIS; k++) {
+				int i = first + k;
+				if (i >= s_npages) break;
+				float y = 24.0f + k * ROWH;
+				float h = ROWH - 2.0f;
+				/* 点一下就播:多 P 视频里"选中"和"播放"是同一个意图,
+				 * 分两步只是多点一次 */
+				bool hit = touched && tp.px >= 6 && tp.px < 302 &&
+				           tp.py >= y && tp.py < y + h;
+				if (hit) { sel = i; picked = i; }
+				ui_rect(6, y, 296, h, (i == sel) ? UI_COL_ACCENT : UI_COL_SEL);
+				char lb[160], db[16];
+				page_label(&s_pages[i], lb, sizeof(lb));
+				float ty = y + (h - th) / 2.0f;
+				float dw = 0.0f;                    /* 时长占掉的右侧宽度 */
+				if (s_pages[i].duration > 0) {
+					snprintf(db, sizeof(db), "%d:%02d",
+					         s_pages[i].duration / 60,
+					         s_pages[i].duration % 60);
+					dw = ui_text_width(db, UI_SHARP);
+					/* 选中行底色是 ACCENT,DIM 压在上面几乎看不见 */
+					ui_text(296.0f - dw, ty, UI_SHARP,
+					        (i == sel) ? UI_COL_WHITE : UI_COL_DIM, db);
+					dw += 10.0f;                    /* 和标题留条缝 */
+				}
+				ui_text_clipped(14, ty, UI_SHARP, UI_COL_WHITE,
+				                lb, 282.0f - dw);
+			}
+			if (s_npages > VIS) {          /* 滚动条 */
+				float track = VIS * ROWH;
+				float bh = track * (float)VIS / (float)s_npages;
+				if (bh < 12.0f) bh = 12.0f;
+				float pos = (float)first / (float)(s_npages - VIS);
+				ui_rect(306, 24, 6, track, C2D_Color32(0x30, 0x30, 0x3C, 0xFF));
+				ui_rect(306, 24 + (track - bh) * pos, 6, bh, UI_COL_ACCENT);
+			}
+			if (ui_button(10, 198, 86, 36, "返回", UI_COL_SEL,
+			              touched, tp.px, tp.py))
+				picked = -2;
+			if (ui_button(104, 198, 100, 36, "上一页", UI_COL_SEL,
+			              touched, tp.px, tp.py))
+				sel -= VIS;
+			if (ui_button(210, 198, 100, 36, "下一页", UI_COL_SEL,
+			              touched, tp.px, tp.py))
+				sel += VIS;
+		} else {
+			/* 调试台开着时照样把它画出来 —— 不画的话下屏这一帧没人清,
+			 * GPU 两个后台缓冲各留着一份旧内容,表现就是闪烁 */
+			touchPosition th2;
+			hidTouchRead(&th2);
+			if (ui_draw_log(touched, (hidKeysHeld() & KEY_TOUCH) != 0,
+			                th2.px, th2.py))
+				ui_bottom_debug(false);
+		}
+		ui_end();
+
+		if (picked == -2) return -1;
+		if (picked >= 0) return picked;
+		if (sel < 0) sel = 0;
+		if (sel >= s_npages) sel = s_npages - 1;
+	}
+	return -1;
+}
+
+/* 真正开播一条流。cid 由调用方给 —— 多 P 视频必须传**选中那一 P**的 cid,
+ * 弹幕、字幕、进度上报全按 cid 走,只有它换对了才是真的换了一集。 */
+static void play_stream(BiliVideo *v, int64_t cid, const char *disp_title) {
+	set_status("解析播放地址...", "resolving play url...");
+	busy_frame("解析播放地址...");
+	ui_trace("resolving playurl qn=%d", g_qn);
+	char url[2048];
+	/* 弹幕先起跑:取流那几个 API 往返是等延迟、不吃带宽的,
+	 * 这段时间正好给弹幕下载用,能省下一两秒 */
+	if (g_danmaku)
+		dm_load_async(cid);
+	/* 字幕不在这里拉:此刻正与 取流/弹幕 并发,3DS httpc 在多路并发下
+	 * 会把响应张冠李戴(实测:字幕内容是别的视频的)。改为播放真正开始、
+	 * 其它请求都收摊之后,由播放器单独去拉(player.c 里 sub_kicked) */
+	sub_free();   /* 先清干净,杜绝上一个视频的残留 */
+	int used_qn = g_qn;
+	int r = bili_get_play_url(v->bvid, cid, g_qn, url, sizeof(url));
+	ui_trace("playurl r=%d", r);
+	if (r != 0 && g_qn != 16) { /* 高清晰度拿不到就回落 360P */
+		printf("qn=%d failed, fallback to 360P\n", g_qn);
+		r = bili_get_play_url(v->bvid, cid, 16, url, sizeof(url));
+		used_qn = 16;
+	}
+	if (r != 0) {
+		{
+			const char *why = bili_last_error();
+			char msg[128];
+			snprintf(msg, sizeof(msg), "取流失败:%s",
+			         (why && why[0]) ? why : "可能需登录或视频受限");
+			set_status(msg, "playurl failed");
+			snprintf(s_busy, sizeof(s_busy), "%s", msg);
+		}
+		dm_free();   /* 弹幕已经起跑了,不播就得把线程收掉 */
+		sub_free();
+		return;
+	}
+	player_set_meta(v->aid, cid, v->bvid);
+	player_set_prefs(g_danmaku, g_force_sw, used_qn);
+	s_busy[0] = 0;
+	player_play(url, disp_title);
+	ui_trace_sync("exit-path: dm_free");
+	dm_free();
+	ui_trace_sync("exit-path: sub_free");
+	sub_free();
+}
+
 static void play_selected(void) {
 	if (s_sel >= s_count) return;
 	BiliVideo *v = &s_list[s_sel];
@@ -567,47 +777,45 @@ static void play_selected(void) {
 			return;
 		}
 	}
-	set_status("解析播放地址...", "resolving play url...");
-	busy_frame("解析播放地址...");
-	ui_trace("resolving playurl qn=%d", g_qn);
-	char url[2048];
-	/* 弹幕先起跑:取流那几个 API 往返是等延迟、不吃带宽的,
-	 * 这段时间正好给弹幕下载用,能省下一两秒 */
-	if (g_danmaku)
-		dm_load_async(v->cid);
-	/* 字幕不在这里拉:此刻正与 取流/弹幕 并发,3DS httpc 在多路并发下
-	 * 会把响应张冠李戴(实测:字幕内容是别的视频的)。改为播放真正开始、
-	 * 其它请求都收摊之后,由播放器单独去拉(player.c 里 sub_kicked) */
-	sub_free();   /* 先清干净,杜绝上一个视频的残留 */
-	int used_qn = g_qn;
-	int r = bili_get_play_url(v->bvid, v->cid, g_qn, url, sizeof(url));
-	ui_trace("playurl r=%d", r);
-	if (r != 0 && g_qn != 16) { /* 高清晰度拿不到就回落 360P */
-		printf("qn=%d failed, fallback to 360P\n", g_qn);
-		r = bili_get_play_url(v->bvid, v->cid, 16, url, sizeof(url));
-		used_qn = 16;
+	/* ---- 分 P ----
+	 * 只在「可能不止一 P」时才发这个请求:3DS 上一次网络往返几百毫秒,
+	 * 而绝大多数视频就一 P。热门/历史/收藏的列表里已经带了分 P 数
+	 * (videos / page 字段),推荐和搜索没带 —— 那两条路要多问一次,
+	 * 但问完就记在 v->pages 里,同一个视频再进来不会再问。 */
+	s_npages = 0;
+	if (v->pages != 1) {
+		busy_frame("检查分P...");
+		if (bili_pagelist(v->bvid, s_pages, MAX_PAGES, &s_npages) != 0)
+			s_npages = 0;
+		if (s_npages > 0) v->pages = s_npages;
+		s_busy[0] = 0;
 	}
-	if (r != 0) {
-		{
-			const char *why = bili_last_error();
-			char msg[128];
-			snprintf(msg, sizeof(msg), "取流失败:%s",
-			         (why && why[0]) ? why : "可能需登录或视频受限");
-			set_status(msg, "playurl failed");
-			snprintf(s_busy, sizeof(s_busy), "%s", msg);
+
+	if (s_npages > 1) {
+		/* 进来时高亮和列表里那个 cid 对得上的一 P(通常是 P1);
+		 * 看完一 P 回到这一页时停在刚看过的那一项,接着往下挑 */
+		int cur = 0;
+		for (int i = 0; i < s_npages; i++)
+			if (s_pages[i].cid == v->cid) { cur = i; break; }
+		while (1) {
+			int pick = choose_page(v, cur);
+			if (pick < 0) break;
+			cur = pick;
+			char t[220];
+			if (s_pages[pick].title[0])
+				snprintf(t, sizeof(t), "P%d %s | %s",
+				         s_pages[pick].page, s_pages[pick].title, v->title);
+			else
+				snprintf(t, sizeof(t), "P%d | %s",
+				         s_pages[pick].page, v->title);
+			play_stream(v, s_pages[pick].cid, t);
+			/* 系统要关我们:别再回选集页了,那里还要画帧 */
+			if (net_is_shutting_down() || aptShouldClose()) break;
 		}
-		dm_free();   /* 弹幕已经起跑了,不播就得把线程收掉 */
-		sub_free();
-		return;
+	} else {
+		play_stream(v, v->cid, v->title);
 	}
-	player_set_meta(v->aid, v->cid, v->bvid);
-	player_set_prefs(g_danmaku, g_force_sw, used_qn);
-	s_busy[0] = 0;
-	player_play(url, v->title);
-	ui_trace_sync("exit-path: dm_free");
-	dm_free();
-	ui_trace_sync("exit-path: sub_free");
-	sub_free();
+
 	/* 【系统正在关我们时别再启动封面下载】否则刚被掐掉的两个 loader 线程
 	 * 立刻又被拉起来,接着 thumb_exit 还得把它们收一遍 —— 白白拖长
 	 * "Closing software"。 */

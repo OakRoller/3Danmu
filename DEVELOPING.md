@@ -46,7 +46,6 @@ xcode-select --install
 ```
 
 Linux / Windows(MSYS2)见 https://devkitpro.org/wiki/Getting_Started。
-
 ### 2. 安装工具链和依赖
 
 ```bash
@@ -838,6 +837,50 @@ stall 310ms ring=48KB vq=0 mb=0 late=120
   管线本身无损:软解 sws 与 MVD 都是全分辨率进纹理,分眼只是切纹理坐标,
   没有任何一步先缩小再切半
 - 2DS 全系没有 3D 屏,开关无效果但无害;离开播放页自动回 2D
+
+### 分 P 视频
+
+**关键事实:每一 P 有自己的 cid,而弹幕、字幕、进度上报全按 cid 走。**
+早先只播 P1,不是"没做选集页"那么简单 —— 播放链路上到处都是
+`v->cid`,那是列表接口给的**第一 P 的** cid。换集必须把这个 cid
+一路换掉,所以 `main.c` 把开播那段抽成了
+`play_stream(v, cid, title)`,cid 由调用方给。
+
+取列表用 `bili_pagelist()`,两条路依次试:
+
+| 接口 | 数组 | 备注 |
+|---|---|---|
+| `x/player/pagelist` | `data[]` | 首选。只返回分 P 数组,风控最松 |
+| `x/web-interface/view` | `data.pages[]` | 兜底。同一个接口还兼查 cid |
+
+顺序和 `bili_get_cid()` 正好相反(那边先 view 后 pagelist)。原因:这里要的
+就是整份数组,而 `view` 会把简介、UP 主、统计、推荐位全带上 ——
+一个 200 P 的合集,`view` 那条路的 JSON 能到几百 KB,3DS 上光解析就是
+明显的一顿,里面 99% 的字段一个都用不上。两边的元素形状一样
+(`{cid, page, part, duration}`),解析共用 `parse_page_array()`。
+
+**别给每个视频都加一次网络往返。** 3DS 上一次往返几百毫秒,而绝大多数
+视频只有一 P。所以 `BiliVideo` 多了个 `pages` 字段,列表接口给了就填:
+
+- 稿件类接口(热门 / 历史)的字段叫 **`videos`**
+- 收藏夹条目的字段叫 **`page`**(不是 `videos`,踩过)
+- 推荐流和搜索**没有**这个字段 → `pages = 0` = 未知
+
+`play_selected()` 只在 `v->pages != 1` 时才发 `pagelist` 请求;问到了就写回
+`v->pages`,同一个视频再进去不会再问。
+
+选集页(`main.c` 的 `choose_page`)是**开播前的独立一页**,不是播放器里的
+子页面 —— 播放器主循环已经有五个子页面共用同一套触控状态和退出路径,
+再塞一个带滚动的列表进去,那几条路径都要跟着分叉,而退出路径正是这个
+工程修得最久的一块。它和登录页一样是个自带 `aptMainLoop()` 的子循环,
+因此同样要在画帧**之前**检查 `net_is_shutting_down() / aptShouldClose()`
+(退出态下 `ui_end` 等的 VBlank 可能永远不来)。
+
+看完一 P 会回到选集页,光标停在刚看过的那一项 —— 连着看下一 P 不用
+退回列表再进来一次。
+
+> 还没做的是**合集(ugc_season)**:那是跨稿件的列表(每一集是独立的
+> bvid),和分 P 不是一回事,要走另一套接口。
 
 ---
 

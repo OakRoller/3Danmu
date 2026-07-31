@@ -15,6 +15,11 @@ typedef struct {
 	int64_t aid;       /* av 号(发弹幕要用,0 = 未知) */
 	int     duration;  /* 秒,0 = 未知 */
 	int64_t views;     /* -1 = 未知 */
+	/* 分 P 数。0 = 未知(接口没给),1 = 确定只有一 P。
+	 * 【为什么值得存这一个 int】播放前要不要发 pagelist 请求就看它:
+	 * 3DS 上一次网络往返几百毫秒,而绝大多数视频只有一 P。
+	 * 列表接口给了这个数就别再问一遍。 */
+	int     pages;
 } BiliVideo;
 
 /* 一条评论。text 存原文,折行在绘制时按屏宽算(字体测量不是线程安全的,
@@ -56,6 +61,19 @@ int bili_search(const char *keyword, int page, BiliVideo *out, int max, int *cou
 
 /* 查视频 cid(播放前必须有 cid)。aid 可为 NULL;传入且为 0 时顺带回填 */
 int bili_get_cid(const char *bvid, int64_t *cid, int64_t *aid);
+
+/* 一个分 P。多 P 视频(合集/番外/课程)每一 P 有自己的 cid,
+ * **弹幕、字幕、进度上报全都按 cid 走** —— 只有 cid 换对了才是真的换了一集 */
+typedef struct {
+	int64_t cid;
+	int     page;       /* P 序号,从 1 开始 */
+	int     duration;   /* 秒,0 = 未知 */
+	char    title[96];  /* part 字段;为空时调用方显示 "P%d" */
+} BiliPage;
+
+/* 取分 P 列表。返回 0 成功,*count 输出条数(单 P 视频返回 1 条)。
+ * 单 P 视频也走这条路,调用方不必分两种情况写。 */
+int bili_pagelist(const char *bvid, BiliPage *out, int max, int *count);
 
 /* 拉 CC 字幕正文 JSON(malloc,调用方 free)。挑第一条中文轨,
  * 无字幕返回 -1 */

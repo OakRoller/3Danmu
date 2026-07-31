@@ -475,10 +475,12 @@ static void parse_video_item(const Json *j, int el, BiliVideo *v, bool is_search
 		v->cid = 0; /* 搜索接口不给 cid */
 	} else {
 		json_get_str(j, el, "owner.name", v->author, sizeof(v->author));
-		int64_t d = 0, view = -1, cid = 0;
+		int64_t d = 0, view = -1, cid = 0, np = 0;
 		if (json_get_int(j, el, "duration", &d)) v->duration = (int)d;
 		if (json_get_int(j, el, "stat.view", &view)) v->views = view;
 		if (json_get_int(j, el, "cid", &cid)) v->cid = cid;
+		/* 分 P 数:稿件类接口叫 videos。拿到了播放前就不用再问 pagelist */
+		if (json_get_int(j, el, "videos", &np) && np > 0) v->pages = (int)np;
 	}
 }
 
@@ -561,10 +563,11 @@ int bili_recommend(int page, BiliVideo *out, int max, int *count) {
 		json_get_str(j, el, "title", v->title, sizeof(v->title));
 		fix_pic_url(v->pic, sizeof(v->pic));
 		json_get_str(j, el, "owner.name", v->author, sizeof(v->author));
-		int64_t d = 0, play = -1, cid = 0;
+		int64_t d = 0, play = -1, cid = 0, np = 0;
 		if (json_get_int(j, el, "duration", &d)) v->duration = (int)d;
 		if (json_get_int(j, el, "stat.view", &play)) v->views = play;
 		if (json_get_int(j, el, "cid", &cid)) v->cid = cid;
+		if (json_get_int(j, el, "videos", &np) && np > 0) v->pages = (int)np;
 		if (v->bvid[0] && v->title[0]) (*count)++;
 	}
 	json_free(j);
@@ -640,9 +643,11 @@ int bili_fav(int page, BiliVideo *out, int max, int *count) {
 		json_get_str(j, el, "cover", v->pic, sizeof(v->pic));
 		fix_pic_url(v->pic, sizeof(v->pic));
 		json_get_str(j, el, "upper.name", v->author, sizeof(v->author));
-		int64_t d = 0, play = -1;
+		int64_t d = 0, play = -1, np = 0;
 		if (json_get_int(j, el, "duration", &d)) v->duration = (int)d;
 		if (json_get_int(j, el, "cnt_info.play", &play)) v->views = play;
+		/* 收藏夹的条目里,分 P 数这个字段叫 page(不是 videos) */
+		if (json_get_int(j, el, "page", &np) && np > 0) v->pages = (int)np;
 		if (v->bvid[0] && v->title[0]) (*count)++;
 	}
 	json_free(j);
@@ -953,6 +958,81 @@ int bili_get_cid(const char *bvid, int64_t *cid, int64_t *aid) {
 	printf("pagelist failed, trying app view\n");
 	if (get_cid_appview(bvid, cid, aid) == 0) { printf("app view ok\n"); return 0; }
 	return -1;
+}
+
+/* ---------- 分 P 列表 ----------
+ *
+ * 两条路都试:
+ *   x/player/pagelist          —— 只返回分 P 数组,轻量、风控最松
+ *   x/web-interface/view       —— data.pages[],和 cid 查询同一个接口
+ *
+ * 顺序和 bili_get_cid 相反(那边先 view 后 pagelist):这里要的就是
+ * **整份数组**,pagelist 天生只返回它,响应小一个数量级;view 会把
+ * 简介、UP 主、统计、推荐位全带上,几 P 的视频也要几十 KB。
+ * 一个 200 P 的合集,view 那条路的 JSON 能到几百 KB —— 3DS 上光解析
+ * 就是明显的一顿,而里面 99% 的字段这里一个都不用。
+ *
+ * 数组里的元素形状两边一样({cid, page, part, duration}),
+ * 所以解析共用一份代码。 */
+static int parse_page_array(const Json *j, int arr, BiliPage *out, int max,
+                            int *count) {
+	int n = json_arr_len(j, arr);
+	if (n <= 0) return -1;
+	if (n > max) n = max;
+	int got = 0;
+	for (int i = 0; i < n; i++) {
+		int el = json_arr_at(j, arr, i);
+		if (el < 0) continue;
+		BiliPage *pg = &out[got];
+		memset(pg, 0, sizeof(*pg));
+		int64_t cid = 0, page = 0, dur = 0;
+		if (!json_get_int(j, el, "cid", &cid) || !cid) continue;
+		pg->cid = cid;
+		pg->page = json_get_int(j, el, "page", &page) ? (int)page : (got + 1);
+		if (json_get_int(j, el, "duration", &dur)) pg->duration = (int)dur;
+		json_get_str(j, el, "part", pg->title, sizeof(pg->title));
+		strip_html(pg->title);
+		got++;
+	}
+	*count = got;
+	return got > 0 ? 0 : -1;
+}
+
+int bili_pagelist(const char *bvid, BiliPage *out, int max, int *count) {
+	*count = 0;
+	if (!bvid || !bvid[0] || max <= 0) return -1;
+	bool is_av = (bvid[0] == 'a' && bvid[1] == 'v');
+	char url[256];
+	char *body = NULL;
+	Json *j;
+
+	snprintf(url, sizeof(url),
+	         "https://api.bilibili.com/x/player/pagelist?%s=%s",
+	         is_av ? "aid" : "bvid", is_av ? bvid + 2 : bvid);
+	printf("GET %.80s\n", url);
+	j = api_get(url, &body);
+	if (j) {
+		int r = parse_page_array(j, json_find(j, -1, "data"), out, max, count);
+		json_free(j);
+		free(body);
+		if (r == 0) {
+			printf("pagelist: %d part(s)\n", *count);
+			return 0;
+		}
+		body = NULL;
+	}
+
+	printf("pagelist failed, trying view.pages\n");
+	snprintf(url, sizeof(url),
+	         "https://api.bilibili.com/x/web-interface/view?%s=%s",
+	         is_av ? "aid" : "bvid", is_av ? bvid + 2 : bvid);
+	j = api_get(url, &body);
+	if (!j) return -1;
+	int r = parse_page_array(j, json_find(j, -1, "data.pages"), out, max, count);
+	json_free(j);
+	free(body);
+	if (r == 0) printf("view.pages: %d part(s)\n", *count);
+	return r;
 }
 
 /* CC 字幕:x/player/wbi/v2 拿字幕轨列表,再拉正文 JSON */
