@@ -15,8 +15,16 @@
 #include "ui.h"
 
 #define PY_MAX     24     /* 拼音缓冲上限 */
-#define CAND_MAX   72     /* 一次检索的候选上限(64 * 8B 在栈上,无压力) */
+/* 一次检索的候选上限。240 * 8B = 2KB 在栈上,而主线程栈有 256KB。
+ * 从 72 提上来是因为:输入多音节拼音时,第一个字的候选来自下面的
+ * 「部分匹配」阶段,而那一阶段能拿到多少名额直接受这个总量限制 ——
+ * 常用字动辄几十个同音字,72 的总盘子分不出来。 */
+#define CAND_MAX   240
 #define CAND_PAGE  8      /* 每页最多画几个(实际能画几个由宽度决定) */
+/* 多音节输入时,「整串连起来的词」最多给几个。
+ * 这些词是顺手推荐,不是用户此刻在挑的东西 —— 他要的是第一个字。
+ * 给满一页都嫌多,5 个正好露个脸又不占地方。 */
+#define WORD_CAP   5
 #define OUT_MAX    120
 
 /* ---------- 词库 ---------- */
@@ -97,10 +105,40 @@ typedef struct {
 static int collect(const char *py, int pylen, Cand *out) {
 	int n = 0;
 	if (!s_blob || pylen <= 0) return 0;
-	/* 1) 整串前缀匹配。留给第 2 阶段的名额要够:pylen 每多一个字母,
-	 * 第 2 阶段就多试一档 L,名额不足时长拼音的首字候选会被挤没。 */
-	int reserve = 24;
-	for (u32 i = lower_bound(py, pylen); i < s_count && n < CAND_MAX - reserve; i++) {
+	/* 1) 整串前缀匹配。
+	 * 给第 2 阶段留的名额。**这个数才是「第一个字有几个候选」的上限**:
+	 * 输入 "nihao" 而词库里没这个词时,第一个字的候选全部来自第 2 阶段。
+	 * 留 180 意味着首字最多能出到 120 个(下面的 quota),够翻十几页了。
+	 *
+	 * 【只有一个字母时不留】那种情况下阶段 2 的循环从 L=0 起,
+	 * 条件 L>=1 直接不成立、一次都不跑 —— 留出来的名额没人用,
+	 * 却把阶段 1 卡在 60 个。名额要留给**真的会来取的人**。 */
+	int reserve = (pylen > 1) ? 180 : 0;
+
+	/* 【多音节时,整串匹配的词只给几个】
+	 * 打 "woshi" 时阶段 1 收的是「我是」「卧室」这类连着的词,而用户
+	 * 多半是想先选出「我」再接着打 —— 让这些词铺满好几页,首字候选
+	 * 就被推到很后面去了。给 WORD_CAP 个,露个脸就行。
+	 *
+	 * 判据不能只看长度:打 "wo" 时 pylen 也大于 1,但那时候「我/握/卧」
+	 * **本身就在阶段 1 里**(拼音 "wo" 也是 "wo" 的前缀),一封顶就把单字
+	 * 砍没了。真正的判据是「存在一个更短的 L 能精确匹配上一个完整音节」——
+	 * 有,才说明用户打的是 wo + shi 这样的多音节。
+	 * 代价是最多 23 次二分查找,相对一次按键完全可以忽略。 */
+	int cap1 = CAND_MAX - reserve;
+	int L_first = 0;      /* 最短的完整音节前缀 = 用户正在打的**第一个字** */
+	for (int L = pylen - 1; L >= 1; L--) {
+		u32 i = lower_bound(py, L);
+		if (i >= s_count) continue;
+		int pl;
+		const char *p = ent_py(i, &pl);
+		if (pl == L && memcmp(p, py, (size_t)L) == 0) {
+			cap1 = WORD_CAP;   /* 见上:多音节才封顶 */
+			L_first = L;       /* 一直记到最短的那个 */
+		}
+	}
+
+	for (u32 i = lower_bound(py, pylen); i < s_count && n < cap1; i++) {
 		int pl;
 		const char *p = ent_py(i, &pl);
 		if (pl < pylen || memcmp(p, py, (size_t)pylen) != 0) break;
@@ -109,17 +147,19 @@ static int collect(const char *py, int pylen, Cand *out) {
 		n++;
 	}
 	/* 2) 部分匹配:L 从长到短,只收拼音恰等于前缀的。
-	 *
-	 * 【每档配额不能一律给 4】原来写死 got < 4,于是输入多音节拼音时
-	 * (比如 "nihao" 而词库里没这个词),第一个字的候选只剩 4 个 ——
-	 * 用户看到的就是「拼音一长,首字反而选不着了」。
-	 * 而**第一个真正匹配上的 L 就是用户最可能想要的那一档**
-	 * (最长的完整音节前缀),它该拿走大部分名额;更短的档次纯属兜底。
-	 * 所以:首个有结果的档给 16 个,之后每档 3 个。 */
-	bool first_hit = true;
+	 * 「拼音一长,首字反而选不着了」这个毛病在这里反复调过:
+	 * 每档 4 → 首档 16 → 首档 120 → 现在只给「第一个字」那一档。 */
 	for (int L = pylen - 1; L >= 1 && n < CAND_MAX; L--) {
 		int got = 0;
-		int quota = first_hit ? 16 : 3;
+		/* 【只有「第一个字」那一档不限量】
+		 * L_first 是最短的完整音节前缀,也就是用户此刻正在挑的那个字。
+		 * 其余档次(打 "nihaoya" 时的 "nihao"/"niha"/"nih")都是
+		 * 顺手推荐:露个脸就够,3 个。
+		 *
+		 * 曾经把「最长的那一档」也放开到 120,理由是它多半是用户想要的词。
+		 * 但那和「用户正在挑第一个字」是矛盾的两种假设 —— 真想要整个词,
+		 * 阶段 1 的前 5 个已经把它摆在最前面了,不必在这儿再来一次。 */
+		int quota = (L == L_first) ? 120 : 3;
 		for (u32 i = lower_bound(py, L); i < s_count && got < quota && n < CAND_MAX; i++) {
 			int pl;
 			const char *p = ent_py(i, &pl);
@@ -128,7 +168,6 @@ static int collect(const char *py, int pylen, Cand *out) {
 			out[n].consume = (u8)L;
 			n++; got++;
 		}
-		if (got) first_hit = false;
 	}
 	return n;
 }
@@ -137,14 +176,24 @@ static int collect(const char *py, int pylen, Cand *out) {
 
 typedef struct { float x, y, w, h; char label[8]; char ch; } Key;
 
-/* 键面(下屏 320x240):数字排常驻顶部,下面三排 字母/符号 可切换 */
-#define KEY_H 32.0f             /* 键高(小键对触屏校准偏移最敏感,尽量大) */
+/* 键面(下屏 320x240):数字排常驻顶部,下面三排 字母/符号 可切换
+ *
+ * 【底排上移过一次,原因未定】
+ * 症状:底排功能键原来是 204..234,**下半截点不动**,而命中区和绘制区
+ * 用的是同一组坐标,代码上看不出问题。
+ * 曾归因于「触摸屏在 y>=215 报不出坐标」——**那个结论是错的**:
+ * HOME 菜单的 Resume/Close 在同样高度点得动。
+ * 当时的依据(调试台底栏拖不动)也不成立:从最底下往上拖 = 看更新的日志,
+ * 已经停在最新一行时本来就滚不动,跟触点无关。
+ * 现在整排上移到 184..212,是**试探**不是修复:还点不动就说明与位置无关。
+ * 代价是键高 32 → 28。 */
+#define KEY_H 28.0f             /* 键高 */
 /* 列间距 31.7 但键宽只给 30:留 1.7px 缝隙。
  * 缝隙若小于 1px(比如宽 31),GPU 取整后有些相邻键会贴在一起看不见缝 */
 #define KEY_DX 31.7f            /* 列间距 */
 #define KEY_W  30.0f
-#define KEY_Y0 68.0f            /* 数字排 y */
-#define KEY_ROW 34.0f           /* 行间距 */
+#define KEY_Y0 64.0f            /* 数字排 y(候选行占到 62) */
+#define KEY_ROW 30.0f           /* 行间距 */
 #define KEY_YL (KEY_Y0 + KEY_ROW)     /* 字母/符号区起始 y */
 static Key s_numkeys[12];
 static int s_nnum = 0;
@@ -221,10 +270,12 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 	 * 是画的时候才知道的。按固定步长翻页,遇到宽词(那页只画得下 3 个)
 	 * 就会把剩下的 5 个直接跳过 —— 它们永远选不到。
 	 * 所以记「本页起点」和「本页实际画了几个」,下一页从起点+已画开始。
-	 * 往回翻需要历史起点,存一个小栈(候选最多 72 个,32 层够深)。 */
+	 * 往回翻需要历史起点,存一个小栈(见下面 cstack 的说明)。 */
 	int cbase = 0;          /* 本页第一个候选的下标 */
 	int cshown = 0;         /* 本页实际画出来的个数(绘制时填) */
-	int cstack[32], cdepth = 0;
+	/* 候选变多之后页数也变多:240 个候选、一页七八个 = 三十多页。
+	 * 栈深要跟着涨,否则往回翻到一半就退不动了 */
+	int cstack[64], cdepth = 0;
 	if (initial) snprintf(text, sizeof(text), "%s", initial);
 	bool confirmed = false, done = false;
 
@@ -374,8 +425,10 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 		}
 		/* 底排功能键:[中/英] [符] [空格] [删除] [完成] */
 		{
-			float y = KEY_YL + 3 * KEY_ROW;   /* = 204,行高 30 到 234 */
-			const float FH = 30.0f;
+			/* 184 + 28 = 212,压在 UI_TOUCH_BOTTOM 以内。
+			 * 别再把这一排往下挪 —— 挪下去就点不动了,而且不报错。 */
+			float y = KEY_YL + 3 * KEY_ROW;   /* = 184 */
+			const float FH = 28.0f;
 			if (ui_button(2, y, 48, FH, en ? "英" : "中",
 			              UI_COL_ACCENT, touched, tx, ty)) {
 				if (has_dict) {          /* 无词库时锁定英文 */

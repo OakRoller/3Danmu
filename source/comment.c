@@ -113,8 +113,14 @@ static void cm_thread(void *arg) {
 	CmReq req = *(const CmReq *)arg;
 	BiliComment *tmp = (BiliComment *)calloc(CM_MAX, sizeof(BiliComment));
 	int got = 0;
-	if (tmp && bili_comments(req.aid, req.page, tmp, CM_MAX, &got) != 0)
+	/* 【「请求失败」和「没有评论」必须分开】两者都是 got==0,但对用户
+	 * 是完全不同的两件事:一个该重试,一个什么都不用做。
+	 * 原来合并成一句「没有评论 / 加载失败」,等于两边都没说清。 */
+	bool req_failed = false;
+	if (!tmp || bili_comments(req.aid, req.page, tmp, CM_MAX, &got) != 0) {
 		got = 0;
+		req_failed = true;
+	}
 
 	__dmb();
 	if (req.gen != s_gen) {           /* 陈旧结果:丢掉,也不许清 loading */
@@ -151,8 +157,13 @@ static void cm_thread(void *arg) {
 	/* 一页 20 条;不足 20 说明到底了。块表满了也不再拉 */
 	if (added > 0 && s_err[0] && s_n > 0) s_err[0] = 0;
 	if (got < CM_MAX || bi + 1 >= CM_BLOCKS) s_more = 0;
-	if (added == 0 && s_n == 0 && !s_err[0])
-		snprintf(s_err, sizeof(s_err), "没有评论 / 加载失败");
+	if (s_n == 0) {
+		/* 空评论区是常态(冷门视频、刚发布的视频),不该像出错一样冷冰冰 */
+		if (req_failed)
+			snprintf(s_err, sizeof(s_err), "评论没加载出来,B 退出再进来试试");
+		else
+			snprintf(s_err, sizeof(s_err), "还没有人评论  ( ´ ▽ ` )ﾉ");
+	}
 	__dmb();
 	s_loading = 0;
 }
@@ -172,7 +183,11 @@ bool comment_load_async(int64_t aid, int page) {
 		__dmb();
 		s_scroll = 0.0f;
 		s_more = 1;
-		snprintf(s_err, sizeof(s_err), "加载中…");
+		/* 【别拿 s_err 当加载占位】绘制那边已经按 s_loading 单独判了。
+		 * 塞进来的话,「加载完但一条都没有」时 s_err 非空,
+		 * 下面那句设「还没有人评论」的条件(!s_err[0])永远不成立 ——
+		 * 于是空评论区**永远显示「加载中…」**。 */
+		s_err[0] = 0;
 	} else if (s_thread) {
 		/* 续页:上一批的线程句柄还留着,先回收再建新的 */
 		threadJoin(s_thread, 8000000000ULL);

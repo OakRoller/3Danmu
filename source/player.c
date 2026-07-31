@@ -114,6 +114,7 @@ typedef struct {
 	s64 pts_fifo[16];           /* 解码顺序的时间戳队列(dts 单调) */
 	int pts_head, pts_len;
 	int pts_drift;              /* 累计修掉的漂移条目数(诊断用) */
+	u32 mvd_skipped;            /* 因残缺/装不下而跳过的 AU 数(诊断用) */
 	/* MVD 原始输出双缓冲(行距 = 16 对齐宽)。
 	 * 曾经想省 470KB 改成单缓冲(理由:搬运已经挪进 worker 并且是同步的,
 	 * MVD 不该在搬运期间回写)——真机上直接翻车:起播后解码器一帧不出,
@@ -1286,6 +1287,17 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 				printf("mvd: skip malformed AU (%lu/%lu consumed, out %luB)\n",
 				       (unsigned long)so, (unsigned long)dn,
 				       (unsigned long)off);
+				/* 前 3 次落盘。确定性降级最可能就是卡在这里 ——
+				 * 若 dn 接近或超过 VIDEO_IN_BUF,那不是数据坏,
+				 * 是我们的输入缓冲装不下那一帧(高细节关键帧) */
+				if (p->mvd_skipped < 3)
+					ui_trace_sync("mvd 跳包#%lu: t=%lums 包=%luB "
+					              "消耗=%lu 产出=%luB 上限=%dKB",
+					              (unsigned long)p->mvd_skipped + 1,
+					              (unsigned long)p->clock_ms,
+					              (unsigned long)dn, (unsigned long)so,
+					              (unsigned long)off, VIDEO_IN_BUF / 1024);
+				p->mvd_skipped++;
 				/* 跳过之后解码器缺了这一段,下次必须重新带参数集,
 				 * 否则它会拿着对不上的参考帧继续解 */
 				p->mvd_need_hdr = true;
@@ -1893,6 +1905,15 @@ static void worker_main(void *arg) {
 					 * 早先是 ret=-99 整段重播 —— 那会**把进度清零**,
 					 * 看到一半被拽回开头比卡一下更难受 */
 					printf("mvd stuck, switching to software decode\n");
+					/* 【落盘,不只是打印】「同一个视频总在同一处降级」是
+					 * 确定性现象 = 那个位置有个我们处理不了的特定包。
+					 * 控制台会滚掉,而这一行带着时间点和现场,
+					 * 事后能直接对上是哪一帧。 */
+					ui_trace_sync("mvd 降级: t=%lums au=%d skip=%lu "
+					              "vq=%d consumed=%d",
+					              (unsigned long)p->clock_ms, au_count,
+					              (unsigned long)p->mvd_skipped,
+					              vq_len, (dr & MVD_CONSUMED) ? 1 : 0);
 					p->dec_switch = 1;
 					p->seek_to = (double)p->clock_ms / 1000.0;
 					__dmb();
@@ -2879,7 +2900,40 @@ static int player_play_inner(const char *url, const char *title) {
 					ui_bottom_debug(false);
 			} else { /* 下屏触控 GUI */
 				ui_begin_bottom();
-				ui_text_clipped(10, 4, UI_SHARP, UI_COL_TEXT, s_cur_title, 300);
+				/* 标题跑马灯:和列表页同一套节奏(停 1.2s → 匀速滚 →
+				 * 到尾停一下 → 回起点)。多 P 视频的标题前面还挂着
+				 * 「P12 某某 | 」,不滚的话真正的片名基本看不到。
+				 * 量宽是完整的字形解析,只在标题变了时才重算。 */
+				{
+					static float ttl_off = 0.0f;
+					static u64   ttl_t0 = 0;
+					static float ttl_w = 0.0f;
+					static size_t ttl_len = 0;
+					const float TW = 300.0f;
+					size_t tl = strlen(s_cur_title);
+					if (ttl_len != tl) {
+						ttl_len = tl;
+						ttl_off = 0.0f;
+						ttl_t0 = osGetTime();
+						ttl_w = ui_text_width(s_cur_title, UI_SHARP);
+					}
+					if (ttl_w > TW) {
+						float span = ttl_w - TW + 12.0f;
+						if (osGetTime() - ttl_t0 > 1200) {
+							ttl_off += 0.55f;
+							if (ttl_off > span + 55.0f) {   /* 尾部停顿后回头 */
+								ttl_off = 0.0f;
+								ttl_t0 = osGetTime();
+							}
+						}
+						float off = ttl_off > span ? span : ttl_off;
+						ui_clip(10, 4, TW, ui_text_height(UI_SHARP) + 4.0f);
+						ui_text(10 - off, 4, UI_SHARP, UI_COL_TEXT, s_cur_title);
+						ui_unclip();
+					} else {
+						ui_text(10, 4, UI_SHARP, UI_COL_TEXT, s_cur_title);
+					}
+				}
 				char tbuf[80];
 				/* seek 已提交但 worker 还没更新时钟的几帧里,继续显示目标
 				 * 位置,否则进度条会先闪回旧位置再跳到新位置 */
