@@ -23,6 +23,7 @@
 #include "settings.h"
 #include "thumb.h"
 #include "subtitle.h"
+#include "tls.h"
 #include "vendor/qrcodegen.h"
 
 #define MAX_LIST 20
@@ -65,7 +66,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.0.0"
+#define APP_VERSION "1.0.1"
 
 static bool g_danmaku = true;       /* 设置:弹幕开关 */
 static int  g_qn = 16;              /* 设置:清晰度 16=360P 32=480P */
@@ -489,7 +490,15 @@ static void do_login(void) {
 			int code = -1;
 			if (bili_qr_poll(qkey, &code) == 0) {
 				if (code == 0) {
-					set_status("登录成功", "login OK");
+					/* code==0 只说明「扫码这一步过了」,不代表 cookie 拿到手了。
+					 * 以前这里无条件报「登录成功」,于是出问题时屏幕说成功、
+					 * 顶栏说未登录 —— 提示本身在骗人,白白多查了一轮 */
+					if (bili_logged_in()) {
+						set_status("登录成功", "login OK");
+					} else {
+						set_status("登录未生效,请重试", "login failed: cookies rejected");
+						printf("qr: code=0 but nav says not logged in\n");
+					}
 					return;
 				}
 				if (code == 86038) {
@@ -881,6 +890,10 @@ int main(void) {
 	thumb_exit();
 	ui_trace_sync("exit: net_exit");
 	net_exit();
+	/* 放在 net_exit 之后:tls 只在扫码登录时用,退出时它一定是空闲的,
+	 * 不会像 httpc 那样有请求卡在里面 */
+	ui_trace_sync("exit: tls_exit");
+	tls_exit();
 	ui_trace_sync("exit: ime_exit");
 	ime_exit();
 	ui_trace_sync("exit: ui_exit");

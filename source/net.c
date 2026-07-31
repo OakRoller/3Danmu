@@ -31,6 +31,13 @@ typedef struct {
 static Cookie s_cookies[MAX_COOKIES];
 static int s_ncookies = 0;
 
+/* 最近一次请求(含重定向链)收到的 Set-Cookie 响应头原文。
+ * 4096 不是 1024:登录时 B 站一次下发五个 Set-Cookie,光 SESSDATA 一条就
+ * 330 字节上下,拼起来轻松过 1K。截断是**静默**的,而且被切掉的正好是排在
+ * SESSDATA 后面的 bili_jct —— 表现为「能登录但发不了弹幕、上报不了历史」,
+ * 看上去完全是另一个 bug。 */
+static char s_setcookie[4096];
+
 /* 短请求互斥:net_get/net_post 全部串行化。
  * 弹幕线程与主线程曾并发调用 httpc,3DS 的 httpc/sslc 对并发短连接
  * 非常脆——一旦服务态被搞坏,之后所有请求都 http error,只能重启程序。
@@ -172,6 +179,59 @@ const char *net_get_cookie(const char *name) {
 
 void net_clear_cookies(void) { s_ncookies = 0; }
 
+const char *net_last_set_cookie(void) { return s_setcookie; }
+
+/* ---------- 自动吸收响应里的登录 cookie ----------
+ *
+ * 【为什么必须这么做】3DS 的 httpc 对**同名多个响应头只给得出一份**。
+ * B 站登录时一次下发五个 Set-Cookie,我们只捞得到排在最前面的 SESSDATA,
+ * bili_jct 永远拿不到 —— 表现为「能登录,但发弹幕和上报历史全失败」。
+ * 一次请求捞不全,那就每次请求都捞:浏览器本来就是这么干的,
+ * 只要后续任何一个响应把 bili_jct 排在第一位,我们就接住了。
+ *
+ * 只收白名单里这几个:别的 cookie(风控下发的一次性标记之类)收进来
+ * 只会污染 cookie 头。空值和 "deleted" 也要挡 —— 那是服务端在**删** cookie,
+ * 照单全收会把好好的登录态覆盖成空字符串。 */
+static const char *const ABSORB[] = {
+	"SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5"
+};
+
+static void absorb_from(const char *src) {
+	if (!src || !src[0]) return;
+	for (size_t k = 0; k < sizeof(ABSORB) / sizeof(ABSORB[0]); k++) {
+		const char *name = ABSORB[k];
+		size_t nl = strlen(name);
+		for (const char *p = src; *p; p++) {
+			bool boundary = (p == src) || p[-1] == ';' || p[-1] == ' ' ||
+			                p[-1] == ',' || p[-1] == '\n';
+			if (!boundary || strncmp(p, name, nl) || p[nl] != '=') continue;
+			const char *v = p + nl + 1;
+			size_t n = strcspn(v, ";\r\n");
+			if (!n || n >= sizeof(s_cookies[0].value)) break;
+			char val[sizeof(s_cookies[0].value)];
+			memcpy(val, v, n);
+			val[n] = 0;
+			if (!strcmp(val, "deleted")) break;   /* 服务端在删,不是在设 */
+			const char *old = net_get_cookie(name);
+			if (old && !strcmp(old, val)) break;  /* 没变,别刷日志 */
+			net_set_cookie(name, val);
+			/* 只记名字和长度,值是有效凭证 */
+			ui_trace("cookie 吸收: %s (%dB%s)", name, (int)n, old ? ",更新" : ",新增");
+			break;
+		}
+	}
+}
+
+static void absorb_login_cookies(void) { absorb_from(s_setcookie); }
+
+/* 给 tls.c 那条路用:它自己收到的**全部** Set-Cookie 行(以 '\n' 分隔)
+ * 走同一套吸收逻辑,白名单和防覆盖的规则不必写两份 */
+void net_absorb_set_cookie(const char *hdr) { absorb_from(hdr); }
+
+static void build_cookie_header(char *out, size_t outlen);
+
+void net_cookie_header(char *out, size_t outlen) { build_cookie_header(out, outlen); }
+
 static void build_cookie_header(char *out, size_t outlen) {
 	out[0] = 0;
 	size_t o = 0;
@@ -199,10 +259,13 @@ void net_log_cookies(const char *tag) {
 	       s_ncookies, (int)strlen(hdr), names);
 }
 
+static void cookie_names(char *out, size_t outlen);   /* 定义在下面存盘那一节 */
+
 int net_cookies_load(void) {
 	FILE *f = fopen(COOKIE_FILE, "r");
-	if (!f) return -1;
+	if (!f) { ui_trace("cookie load: 打不开(文件不存在?)"); return -1; }
 	char line[600];
+	int n = 0;
 	while (fgets(line, sizeof(line), f)) {
 		char *eq = strchr(line, '=');
 		if (!eq) continue;
@@ -210,23 +273,77 @@ int net_cookies_load(void) {
 		char *v = eq + 1;
 		char *nl = strpbrk(v, "\r\n");
 		if (nl) *nl = 0;
-		if (line[0] && v[0])
-			net_set_cookie(line, v);
+		if (line[0] && v[0]) { net_set_cookie(line, v); n++; }
 	}
 	fclose(f);
+	char names[140];
+	cookie_names(names, sizeof(names));
+	ui_trace("cookie load: n=%d [%s]", n, names);
 	return 0;
 }
 
-int net_cookies_save(void) {
+/* ---------- 存盘 ----------
+ *
+ * 【为什么要带 who】排查「好好的登录态被写没了」时,只知道「文件变成了
+ * 三项」毫无用处 —— 四个调用点写出来的形状差别很大,但事后从文件上
+ * **看不出是谁写的**。所以每次落盘都记一行:谁写的、写了几个、都有谁。
+ *
+ * 【为什么要拦一道】net_cookies_save 是「把内存原样刷到盘上」,
+ * 内存要是因为别处的 bug 少了 SESSDATA,这一刷就把盘上好的那份也毁了,
+ * 而且**不可逆**。所以加一条单向保险:内存里没有 SESSDATA、盘上却有时,
+ * 拒绝写。代价是这种情况下盘上会短暂地比内存旧 —— 那是安全的方向,
+ * 下次启动照样能登上。注销是**故意**要清掉的,走 _force 绕开保险。
+ */
+static void cookie_names(char *out, size_t outlen) {
+	size_t o = 0;
+	out[0] = 0;
+	for (int i = 0; i < s_ncookies && o + 24 < outlen; i++)
+		o += (size_t)snprintf(out + o, outlen - o, "%s%s",
+		                      i ? "," : "", s_cookies[i].name);
+}
+
+static bool file_has_sessdata(void) {
+	FILE *f = fopen(COOKIE_FILE, "r");
+	if (!f) return false;
+	char line[600];
+	bool got = false;
+	while (fgets(line, sizeof(line), f)) {
+		if (!strncmp(line, "SESSDATA=", 9) &&
+		    line[9] && line[9] != '\r' && line[9] != '\n') { got = true; break; }
+	}
+	fclose(f);
+	return got;
+}
+
+static int cookies_write(const char *who) {
 	mkdir("sdmc:/3ds", 0777);
 	mkdir(COOKIE_DIR, 0777);
 	FILE *f = fopen(COOKIE_FILE, "w");
-	if (!f) return -1;
+	if (!f) { ui_trace("cookie save[%s]: fopen 失败", who); return -1; }
 	for (int i = 0; i < s_ncookies; i++)
 		fprintf(f, "%s=%s\n", s_cookies[i].name, s_cookies[i].value);
 	fclose(f);
+	char names[140];
+	cookie_names(names, sizeof(names));
+	ui_trace("cookie save[%s]: n=%d [%s]", who, s_ncookies, names);
 	return 0;
 }
+
+int net_cookies_save_from(const char *who) {
+	if (!who) who = "?";
+	if (!net_get_cookie("SESSDATA") && file_has_sessdata()) {
+		char names[140];
+		cookie_names(names, sizeof(names));
+		ui_trace("cookie save[%s]: 拒绝!内存无 SESSDATA 而盘上有 n=%d [%s]",
+		         who, s_ncookies, names);
+		return -1;
+	}
+	return cookies_write(who);
+}
+
+int net_cookies_save_force(const char *who) { return cookies_write(who ? who : "?"); }
+
+int net_cookies_save(void) { return net_cookies_save_from("?"); }
 
 /* ---------- 请求 ---------- */
 
@@ -384,6 +501,8 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 	if (s_shutdown) return -1;   /* 正在退出:别再开新连接,否则清理永远等不完 */
 	if (depth > MAX_REDIRECTS) return -1;
 	res->data = NULL; res->len = 0; res->status = 0;
+	/* 只在最外层清:跟随重定向时要保留中途那一跳设的 cookie */
+	if (depth == 0) s_setcookie[0] = 0;
 
 	httpcContext ctx;
 	Result rc = httpcOpenContext(&ctx, method, url, 1);
@@ -461,6 +580,19 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 	}
 
 	learn_server_time(&ctx);
+
+	/* 【Set-Cookie 留档】扫码登录曾经只从 poll 返回的 data.url 的 query 里
+	 * 取 SESSDATA —— 服务端一改返回格式,那条路就悄无声息地断了(url 还在、
+	 * code 还是 0,只是参数没了)。响应头才是设 cookie 的正经渠道,这里
+	 * 统一留一份,谁需要谁取。
+	 * 注意:3DS 的 httpc 对同名多个响应头只给得出一份,所以这里拿到的可能
+	 * 不是全部 —— 当兜底用,不能当唯一来源。 */
+	/* 直接读进静态缓冲 —— 4KB 放栈上对 3DS 的线程栈太奢侈。
+	 * 每一跳都读、每一跳都吸收:重定向链中途设的 cookie 同样算数。 */
+	if (R_FAILED(httpcGetResponseHeader(&ctx, "Set-Cookie",
+	                                    s_setcookie, sizeof(s_setcookie))))
+		s_setcookie[0] = 0;
+	absorb_login_cookies();
 
 	if (status >= 301 && status <= 308 && status != 304) {
 		char loc[1024] = {0};

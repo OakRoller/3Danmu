@@ -18,7 +18,7 @@ INCLUDES	:=	source
 ROMFS		:=	romfs
 
 APP_TITLE       := 3Danmu
-APP_DESCRIPTION := A Homebrew Client for 3DS (v1.0.0)
+APP_DESCRIPTION := A Homebrew Client for 3DS (v1.0.1)
 APP_AUTHOR      := yinuo
 
 #---------------------------------------------------------------------------------

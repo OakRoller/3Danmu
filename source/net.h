@@ -64,8 +64,21 @@ void net_response_free(HttpResponse *res);
 void        net_set_cookie(const char *name, const char *value);
 const char *net_get_cookie(const char *name);          /* 无则返回 NULL */
 void        net_clear_cookies(void);
+/* 最近一次请求收到的 Set-Cookie 响应头原文(可能为空字符串)。
+ * 3DS httpc 对同名多个头只给一份,当兜底用 */
+const char *net_last_set_cookie(void);
+/* 把一段 Set-Cookie 文本(多行用 '\n' 分隔)里的登录 cookie 收进来。
+ * 给 tls.c 那条路用,和 httpc 路径共用同一套白名单与防覆盖规则 */
+void        net_absorb_set_cookie(const char *hdr);
+/* 当前会随请求发出的 Cookie 头内容(不含 "Cookie: " 前缀) */
+void        net_cookie_header(char *out, size_t outlen);
 int         net_cookies_load(void);                    /* sdmc:/3ds/3danmu/cookies.txt */
-int         net_cookies_save(void);
+/* who 只用于 trace.log,方便事后认领「是谁把文件写成这样的」。
+ * _from 带保险:内存里没 SESSDATA 而盘上有时拒绝写(防止把登录态刷没)。
+ * _force 不带,只给注销用 —— 那是**故意**要清掉。 */
+int         net_cookies_save_from(const char *who);
+int         net_cookies_save_force(const char *who);
+int         net_cookies_save(void);                    /* = _from("?") */
 /* 打印当前 cookie 名单(排障用,由调用方挑时机) */
 void        net_log_cookies(const char *tag);
 

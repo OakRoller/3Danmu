@@ -7,6 +7,7 @@
 #include "net.h"
 #include "ui.h"
 #include "jsonx.h"
+#include "tls.h"
 #include "wbi.h"
 #include "md5.h"
 
@@ -60,6 +61,45 @@ static int parse_duration(const char *s) {
 }
 
 /* 从 URL query 中提取参数值(不解码) */
+/* 从 Set-Cookie 响应头里取一个 cookie 的值。
+ * 形如 "SESSDATA=xxx; Path=/; Domain=.bilibili.com; Expires=Wed, 01-Jan-..."
+ * 值到第一个 ';' 为止。逗号不能当分隔:Expires 里就有一个,
+ * 而 SESSDATA 自己的逗号是 %2C,不会以裸逗号出现。 */
+static bool header_cookie(const char *hdr, const char *name, char *out, size_t outlen) {
+	if (!hdr || !*hdr) return false;
+	size_t nl = strlen(name);
+	for (const char *p = hdr; *p; p++) {
+		bool boundary = (p == hdr) || p[-1] == ';' || p[-1] == ' ' ||
+		                p[-1] == ',' || p[-1] == '\n';
+		if (!boundary) continue;
+		if (strncmp(p, name, nl) || p[nl] != '=') continue;
+		const char *v = p + nl + 1;
+		size_t n = strcspn(v, ";\r\n");
+		if (n >= outlen) n = outlen - 1;
+		memcpy(out, v, n);
+		out[n] = 0;
+		return n > 0;
+	}
+	return false;
+}
+
+/* 只列 query 的**参数名**,不带值 —— 值里可能是有效凭证,不能进日志。
+ * 「url 有 166 字节但一个参数都没解析出来」时,光看长度分不清是格式变了
+ * 还是解析写错了;把名字列出来一眼就知道 */
+static void query_names(const char *url, char *out, size_t outlen) {
+	size_t o = 0;
+	out[0] = 0;
+	const char *p = strchr(url, '?');
+	p = p ? p + 1 : url;
+	while (p && *p && o + 20 < outlen) {
+		size_t n = strcspn(p, "=&");
+		o += (size_t)snprintf(out + o, outlen - o, "%s%.*s",
+		                      o ? "," : "", (int)n, p);
+		p = strchr(p, '&');
+		if (p) p++;
+	}
+}
+
 static bool query_param(const char *url, const char *name, char *out, size_t outlen) {
 	size_t nl = strlen(name);
 	const char *p = strchr(url, '?');
@@ -159,7 +199,7 @@ static int fetch_buvid(void) {
 		char nut[16];
 		snprintf(nut, sizeof(nut), "%ld", (long)net_now());
 		net_set_cookie("b_nut", nut);
-		net_cookies_save();
+		net_cookies_save_from("buvid/b_nut");
 	}
 	if (net_get_cookie("buvid3")) return 0;
 	char *body = NULL;
@@ -175,6 +215,9 @@ static int fetch_buvid(void) {
 		snprintf(nut, sizeof(nut), "%ld", (long)net_now());
 		net_set_cookie("b_nut", nut);
 	}
+	/* 这里以前不存盘,于是新取到的 buvid3/buvid4 只活在内存里,盘上还是旧的
+	 * —— 内存和文件从此不一致,排查时对不上账 */
+	net_cookies_save_from("buvid/fetch");
 	json_free(j);
 	free(body);
 	return b3[0] ? 0 : -1;
@@ -324,7 +367,7 @@ static int fetch_buvid_fp(void) {
 	} else {
 		printf("gaia: ExClimbWuzhi failed (net)\n");
 	}
-	net_cookies_save();
+	net_cookies_save_from("gaia");
 	return 0;
 }
 
@@ -370,7 +413,12 @@ int bili_init(void) {
 	fetch_buvid();
 	fetch_buvid_fp();  /* 指纹注册:x/player/wbi/v2 这类严风控接口要查 */
 	fetch_nav();
+	/* 途中任何一个响应都可能补上缺的登录 cookie(见 net.c 的 absorb),
+	 * 落一次盘,免得每次启动都要重新捡一遍 */
+	net_cookies_save_from("init");
 	net_log_cookies("init");   /* 此刻才是「该有的都有了」 */
+	ui_trace("init: logged_in=%d jct=%s", (int)s_logged_in,
+	         net_get_cookie("bili_jct") ? "有" : "无");
 	return 0;
 }
 
@@ -378,8 +426,9 @@ bool bili_logged_in(void) { return s_logged_in; }
 const char *bili_username(void) { return s_logged_in ? s_uname : NULL; }
 
 void bili_logout(void) {
+	ui_trace("logout: 用户主动注销,清空 cookie");
 	net_clear_cookies();
-	net_cookies_save();
+	net_cookies_save_force("logout");   /* 故意清掉,绕开保险 */
 	s_logged_in = false;
 	s_uname[0] = 0;
 	fetch_buvid();
@@ -1096,7 +1145,16 @@ int bili_subtitle_fetch(const char *bvid, int64_t aid, int64_t cid,
  * 账号的历史记录里,手机/网页端能接着看 */
 int bili_report_history(int64_t aid, int64_t cid, int progress_s) {
 	const char *csrf = net_get_cookie("bili_jct");
-	if (!csrf || !csrf[0] || !aid || !cid) return -1;
+	if (!csrf || !csrf[0] || !aid || !cid) {
+		/* 每个视频只提一次,别刷屏。缺 bili_jct 是常态(见 bili_qr_poll),
+		 * 静默返回的话用户只会觉得「历史记录莫名其妙不同步」 */
+		static int64_t warned_cid = 0;
+		if ((!csrf || !csrf[0]) && cid && cid != warned_cid) {
+			warned_cid = cid;
+			printf("history: 无 bili_jct,本次不上报(需手动导入)\n");
+		}
+		return -1;
+	}
 	char aidstr[24], cidstr[24];
 	i64_to_str(aid, aidstr);
 	i64_to_str(cid, cidstr);
@@ -1130,8 +1188,12 @@ int bili_send_danmaku(int64_t aid, int64_t cid, int progress_ms,
                       const char *msg) {
 	const char *csrf = net_get_cookie("bili_jct");
 	if (!csrf || !csrf[0]) {
-		snprintf(s_last_err, sizeof(s_last_err), "未登录(cookie 缺 bili_jct)");
-		printf("dm post: no bili_jct cookie (re-login needed)\n");
+		/* 扫码登录拿不到 bili_jct(3DS 的 httpc 读不全 Set-Cookie,
+		 * 详见 bili_qr_poll 里的说明)。这不是「没登录」,别这么写 ——
+		 * 用户明明看得见自己的用户名,提示说未登录只会让他反复重登。 */
+		snprintf(s_last_err, sizeof(s_last_err),
+		         "发弹幕需手动导入 bili_jct,见 README");
+		printf("dm post: no bili_jct (需手动导入,扫码登录拿不到)\n");
 		return -1;
 	}
 	if (!aid || !cid || !msg || !msg[0]) {
@@ -1315,7 +1377,97 @@ int bili_qr_generate(char *qr_url, size_t un, char *qrcode_key, size_t kn) {
 	return ok ? 0 : -1;
 }
 
+/* 【试着补上 bili_jct】
+ * 扫码登录只拿得到 SESSDATA:B 站一次下发五个 Set-Cookie,而 3DS 的 httpc
+ * 对同名响应头只给得出一份(已确认 libctru 只有 httpcGetResponseHeader,
+ * 没有枚举接口)。
+ *
+ * bili_jct 是 CSRF 令牌。会话里缺它时,有些页面会重新下发 —— 而我们读得到
+ * 每个响应的**第一个** Set-Cookie,只要某个页面下发的第一个正好是它就成了。
+ * 这是试探,成不成取决于服务端行为;失败只是白跑几个请求,不影响其它功能。
+ *
+ * 只在**刚登录完**跑一次:每次开机都跑的话,那几个 HTML 页面加起来
+ * 几百 KB,3DS 上的启动会明显变慢,而结果多半和上次一样。 */
+static void try_recover_jct(void) {
+	if (net_get_cookie("bili_jct") || !net_get_cookie("SESSDATA")) return;
+	/* 从轻到重:nav 是小 JSON,后两个是整页 HTML,能早停就早停 */
+	static const char *const URLS[] = {
+		"https://api.bilibili.com/x/web-interface/nav",
+		"https://passport.bilibili.com/login",
+		"https://www.bilibili.com/account/history",
+	};
+	for (size_t i = 0; i < sizeof(URLS) / sizeof(URLS[0]); i++) {
+		HttpResponse r;
+		if (net_get(URLS[i], &r) != 0) { ui_trace("jct 探测 %d: 请求失败", (int)i); continue; }
+		/* 只记「第一个 cookie 叫什么」和长度 —— 值是有效凭证,不进日志 */
+		const char *sc = net_last_set_cookie();
+		char nm[48] = {0};
+		size_t n = strcspn(sc, "=");
+		if (n < sizeof(nm)) { memcpy(nm, sc, n); nm[n] = 0; }
+		ui_trace("jct 探测 %d: http %d sc=%dB 首个=[%s] jct=%s",
+		         (int)i, r.status, (int)strlen(sc), nm,
+		         net_get_cookie("bili_jct") ? "有" : "无");
+		net_response_free(&r);
+		if (net_get_cookie("bili_jct")) {
+			net_cookies_save_from("jct探测");
+			return;
+		}
+	}
+}
+
+/* 【走自己的 TLS 拿全部 Set-Cookie】
+ * 成功返回 0 并且 *code 有效;返回负数表示这条路没走通,
+ * 调用方**必须**退回 httpc 路径 —— 那条路虽然只拿得到 SESSDATA,
+ * 但至少能登上。新路子不能让事情比现在更糟。 */
+static int qr_poll_tls(const char *qrcode_key, int *code) {
+	if (tls_init() != 0) return -1;
+
+	char path[384];
+	snprintf(path, sizeof(path),
+	         "/x/passport-login/web/qrcode/poll?qrcode_key=%s", qrcode_key);
+	char ck[2048];
+	net_cookie_header(ck, sizeof(ck));
+
+	int status = 0;
+	char sc[4096], body[4096];
+	if (tls_get("passport.bilibili.com", path, ck, &status,
+	            sc, sizeof(sc), body, sizeof(body)) != 0)
+		return -2;
+	if (status != 200) { ui_trace("qr(tls): http %d", status); return -3; }
+
+	Json *j = json_parse(body, strlen(body));
+	if (!j) { ui_trace("qr(tls): JSON 解析失败 body=%dB", (int)strlen(body)); return -4; }
+	int64_t c = -1;
+	json_get_int(j, -1, "data.code", &c);
+	*code = (int)c;
+
+	if (c == 0) {
+		/* 只记有几行、每行的 cookie 名 —— 值是有效凭证 */
+		int lines = sc[0] ? 1 : 0;
+		for (const char *p = sc; *p; p++) if (*p == '\n') lines++;
+		net_absorb_set_cookie(sc);
+		ui_trace("qr(tls): 登录成功,Set-Cookie %d 行 %dB -> sess=%s jct=%s uid=%s",
+		         lines, (int)strlen(sc),
+		         net_get_cookie("SESSDATA")   ? "有" : "无",
+		         net_get_cookie("bili_jct")   ? "有" : "无",
+		         net_get_cookie("DedeUserID") ? "有" : "无");
+		net_cookies_save_from("qrlogin/tls");
+		fetch_nav();
+		net_cookies_save_from("qrlogin/tls/nav");
+	}
+	json_free(j);
+	return 0;
+}
+
 int bili_qr_poll(const char *qrcode_key, int *code) {
+	{
+		int c = -1;
+		int r = qr_poll_tls(qrcode_key, &c);
+		if (r == 0) { *code = c; return 0; }
+		/* 每次轮询都失败会刷屏,只在第一次记一行 */
+		static bool warned = false;
+		if (!warned) { warned = true; ui_trace("qr: TLS 路径不可用(%d),退回 httpc", r); }
+	}
 	*code = -1;
 	char url[384];
 	snprintf(url, sizeof(url),
@@ -1330,16 +1482,60 @@ int bili_qr_poll(const char *qrcode_key, int *code) {
 	*code = (int)c;
 
 	if (c == 0) {
-		/* 登录成功:cookie 值都在 data.url 的 query 里 */
-		char curl[1024] = {0};
+		/* 登录成功:cookie 值都在 data.url 的 query 里。
+		 * 2048 不是 1024:这串是 crossDomain 跳转 URL,末尾还挂着一个
+		 * 整体转义过的 gourl。截断了的话前面的 SESSDATA 可能刚好被切掉一半,
+		 * 而 query_param 对「截断」和「本来就这么长」分不出来 —— 静默出错 */
+		char curl[2048] = {0};
 		json_get_str(j, -1, "data.url", curl, sizeof(curl));
 		char val[512];
-		if (query_param(curl, "DedeUserID", val, sizeof(val)))       net_set_cookie("DedeUserID", val);
-		if (query_param(curl, "DedeUserID__ckMd5", val, sizeof(val))) net_set_cookie("DedeUserID__ckMd5", val);
-		if (query_param(curl, "SESSDATA", val, sizeof(val)))          net_set_cookie("SESSDATA", val);
-		if (query_param(curl, "bili_jct", val, sizeof(val)))          net_set_cookie("bili_jct", val);
-		net_cookies_save();
+		int n_uid = 0, n_md5 = 0, n_sess = 0, n_jct = 0;
+		if (query_param(curl, "DedeUserID", val, sizeof(val)))        { n_uid  = (int)strlen(val); net_set_cookie("DedeUserID", val); }
+		if (query_param(curl, "DedeUserID__ckMd5", val, sizeof(val))) { n_md5  = (int)strlen(val); net_set_cookie("DedeUserID__ckMd5", val); }
+		if (query_param(curl, "SESSDATA", val, sizeof(val)))          { n_sess = (int)strlen(val); net_set_cookie("SESSDATA", val); }
+		if (query_param(curl, "bili_jct", val, sizeof(val)))          { n_jct  = (int)strlen(val); net_set_cookie("bili_jct", val); }
+		/* 只记长度,不记值 —— 这几个是有效凭证,写进 trace.log 就等于泄露 */
+		ui_trace("qr ok: url=%dB uid=%d md5=%d sess=%d jct=%d",
+		         (int)strlen(curl), n_uid, n_md5, n_sess, n_jct);
+		/* poll 的正文里会不会直接带着?顺手看一眼,不花钱 */
+		ui_trace("qr: poll 正文 %dB 含jct=%d 含cookie_info=%d",
+		         body ? (int)strlen(body) : 0,
+		         (body && strstr(body, "bili_jct")) ? 1 : 0,
+		         (body && strstr(body, "cookie_info")) ? 1 : 0);
+
+		/* 【兜底】data.url 里没有就去 Set-Cookie 响应头里找。
+		 * 服务端把凭证从 query 挪进响应头之后,老路径会「成功地拿到 0 个
+		 * cookie」——code 还是 0、url 还在,只是参数没了,静默失效。 */
+		if (!n_sess) {
+			char names[200];
+			query_names(curl, names, sizeof(names));
+			ui_trace("qr: data.url 无凭证,参数为 [%s]", names);
+			const char *sc = net_last_set_cookie();
+			if (header_cookie(sc, "DedeUserID", val, sizeof(val)))        { n_uid  = (int)strlen(val); net_set_cookie("DedeUserID", val); }
+			if (header_cookie(sc, "DedeUserID__ckMd5", val, sizeof(val))) { n_md5  = (int)strlen(val); net_set_cookie("DedeUserID__ckMd5", val); }
+			if (header_cookie(sc, "SESSDATA", val, sizeof(val)))          { n_sess = (int)strlen(val); net_set_cookie("SESSDATA", val); }
+			if (header_cookie(sc, "bili_jct", val, sizeof(val)))          { n_jct  = (int)strlen(val); net_set_cookie("bili_jct", val); }
+			ui_trace("qr: Set-Cookie %dB -> uid=%d md5=%d sess=%d jct=%d",
+			         (int)strlen(sc ? sc : ""), n_uid, n_md5, n_sess, n_jct);
+		}
+		/* 【为什么不去请求 data.url】
+		 * 新版流程里 data.url 的参数是 [ticket, gourl, first_domain],
+		 * 看着像「拿 ticket 去换 cookie」。实测过了:那个地址返回 200,
+		 * 但**一个 Set-Cookie 都不设**,而且会跟着 gourl 把 B 站首页
+		 * 整整 143KB 的 HTML 拉下来。纯浪费流量,别再加回去。
+		 *
+		 * bilibili.com 的 cookie 确实全在 poll 那次响应的多个 Set-Cookie 头里,
+		 * 但 3DS 的 httpc 对同名响应头**只给得出一份**,我们只读得到
+		 * 排在最前面的 SESSDATA。所以扫码登录能登上、但注定缺 bili_jct。
+		 * 需要 csrf 的功能改由用户手动导入 bili_jct 解锁(见 README)。 */
+		net_cookies_save_from("qrlogin");
 		fetch_nav(); /* 刷新登录态和用户名 */
+		try_recover_jct();
+		/* 再存一次:nav 的响应里可能补发了 bili_jct(登录那一次的响应头
+		 * 只捞得到 SESSDATA),被 absorb 收进内存了但还没落盘 */
+		net_cookies_save_from("qrlogin/nav");
+		ui_trace("qr ok: fetch_nav 之后 logged_in=%d jct=%s", (int)s_logged_in,
+		         net_get_cookie("bili_jct") ? "有" : "无");
 	}
 	json_free(j);
 	free(body);
