@@ -45,7 +45,21 @@ xcode-select --install
 # 安装后重启,让环境变量生效
 ```
 
-Linux / Windows(MSYS2)见 https://devkitpro.org/wiki/Getting_Started。
+Linux 见 https://devkitpro.org/wiki/Getting_Started。
+
+**Windows**:装 https://github.com/devkitPro/installer/releases 的
+`devkitProUpdater-x.x.x.exe`,勾上 **3DS Development**。它会自带一个 MSYS2,
+**之后所有命令都在「MSYS2 devkitPro」那个开始菜单快捷方式里敲**
+(不是 cmd、不是 PowerShell、也不是 Git Bash —— 那几个里没有 `$DEVKITPRO`,
+连 `make` 都找不到)。几点 Windows 专属的注意:
+
+- **工程路径不能有空格**(devkitPro 的 Makefile 不支持)。
+  盘符在 MSYS2 里写成 `/k/claude/3Danmu-main` 这种形式
+- MSYS2 里**没有也不需要 `sudo`**,那个 shell 本身就能写 `$DEVKITPRO`
+  (`build-ffmpeg-3ds.sh` 已经处理了这个,有 sudo 才用)
+- `bannertool` / `makerom`(打 CIA 用)的 Releases 有 Windows 预编译版,
+  直接下 `.exe` 丢进 PATH 即可,不用像 macOS 那样自己编
+
 ### 2. 安装工具链和依赖
 
 ```bash
