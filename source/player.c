@@ -2139,6 +2139,11 @@ static int player_play_inner(const char *url, const char *title) {
 		 * (或超时 4 秒)才交还给时钟。挡住一切残余的短暂回跳 */
 		double seek_latch = -1.0;
 		u64 seek_latch_t0 = 0;
+		/* 「缓冲中」的去抖起点(0 = 当前不处于卡顿)。
+		 * p->buffering 是按音频缓冲余量算的,正常播放时也会零星置位几十毫秒。
+		 * 直接照着它画,提示就会在流畅播放中一闪一闪 —— 用户看到的是
+		 * 「一直在缓冲」,实际画面根本没停。所以要卡住持续时间再说。 */
+		u64 stall_t0 = 0;
 		double last_clock_dbg = -1.0;
 		u64 last_report = 0;         /* 观看历史上报节流 */
 		/* 上报线程:主线程只置标志,网络请求不许出现在渲染循环里 */
@@ -2351,8 +2356,19 @@ static int player_play_inner(const char *url, const char *title) {
 				 * 显示条件除了 buffering 还加了「首帧还没出过」:
 				 * 开播头几秒 buffering 可能尚未置位,而屏幕全黑 ——
 				 * 黑屏没有任何字,和死机没法区分,这正是被报过的观感 bug。 */
-				if ((p->buffering || p->net_stall || p->dbg_decoded == 0)
-				    && !p->pause) {
+				/* 【去抖】只有真卡住了才提示。
+				 * 判据要的是「持续了多久」,不是「此刻是不是」——
+				 * p->buffering 按音频缓冲余量算,正常播放中也会零星置位
+				 * 几十毫秒,照着它画就是一闪一闪的假警报,用户看到的是
+				 * 「一直在缓冲」,而画面其实一秒都没停。
+				 * 起播黑屏(dbg_decoded==0)和断线重连门槛更低:
+				 * 那两种情况屏幕上本来就没东西,迟迟不出字和死机没法区分。 */
+				bool stalling = (p->buffering || p->net_stall ||
+				                 p->dbg_decoded == 0) && !p->pause;
+				if (!stalling) stall_t0 = 0;
+				else if (!stall_t0) stall_t0 = osGetTime();
+				u32 hold_ms = (p->dbg_decoded == 0 || p->net_stall) ? 250 : 700;
+				if (stall_t0 && osGetTime() - stall_t0 >= hold_ms) {
 					bool waiting_dm = s_pref_danmaku && dm_loading();
 					static const char *dots[4] = { "", ".", "..", "..." };
 					char buf[48];
