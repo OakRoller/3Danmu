@@ -233,6 +233,7 @@ static bool s_pref_sub = false;    /* CC 字幕开关 */
  * 发虚是明码标价的代价。 */
 static int  s_dm_size = 1;         /* 弹幕字号 0小 1中 2大(默认中) */
 static int  s_sub_size = 1;        /* 字幕字号 0小 1中 2大(默认中) */
+static int  s_dm_area = 0;         /* 弹幕覆盖范围 0全屏 1半屏 2四分之一 3八分之一 */
 
 /* ---------- 画面比例 ----------
  *
@@ -297,6 +298,8 @@ void player_prefs_init(void) {
 	if (v >= 0 && v <= 2) s_dm_size = v;
 	v = settings_get("sub_size", s_sub_size);
 	if (v >= 0 && v <= 2) s_sub_size = v;
+	v = settings_get("dm_area", s_dm_area);
+	if (v >= 0 && v <= 3) s_dm_area = v;
 	/* 画面比例**要存**(和 3D 相反)。3D 是逐片决定的(2D 片开着只会花屏),
 	 * 比例是「我这台机器上想怎么看」——用户把 16:9 强制上之后,
 	 * 下一个视频还得再点一次的话,这个设置就等于没有。 */
@@ -2143,6 +2146,7 @@ static int player_play_inner(const char *url, const char *title) {
 
 	dm_reset();
 	dm_set_size(s_dm_size);     /* 让模块与设置页显示一致 */
+	dm_set_area(s_dm_area);
 	sub_set_size(s_sub_size);
 	s_pref_3d = 0;          /* 每个视频默认 2D,要 3D 手动开 */
 	ui_set_3d(false);
@@ -2501,6 +2505,7 @@ static int player_play_inner(const char *url, const char *title) {
 						s_dm_size = (s_dm_size + 1) % 3;
 						settings_set("dm_size", s_dm_size);
 						dm_set_size(s_dm_size);
+						dm_set_area(s_dm_area);   /* 行数依赖字号,重算一次 */
 					}
 				}
 				{	/* 字幕字号(占原"返回"的位置) */
@@ -2524,6 +2529,23 @@ static int player_play_inner(const char *url, const char *title) {
 						s_pref_aspect = (s_pref_aspect + 1) % ASPECT_N;
 						settings_set("aspect", s_pref_aspect);
 						calc_output_size(p);
+					}
+				}
+				{	/* 弹幕范围:从上屏顶部往下占多少 */
+					static const char *ar[4] = { "弹幕范围:全屏",
+					                             "弹幕范围:1/2",
+					                             "弹幕范围:1/4",
+					                             "弹幕范围:1/8" };
+					if (ui_button(165, PS_Y(2), 145, PS_H, ar[s_dm_area],
+					              s_dm_area ? UI_COL_ACCENT : UI_COL_SEL,
+					              btn_touch, tp.px, tp.py)) {
+						s_dm_area = (s_dm_area + 1) % 4;
+						settings_set("dm_area", s_dm_area);
+						dm_set_area(s_dm_area);
+						/* 行数是范围 x 字号一起决定的,光看档位看不出
+						 * 实际剩几行 —— 打出来,免得又靠数屏幕 */
+						printf("danmaku area=%d -> %d rows\n",
+						       s_dm_area, dm_rows());
 					}
 				}
 				if (ui_button(10, PS_Y(3), 145, PS_H, "调试台", UI_COL_SEL,
