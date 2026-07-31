@@ -66,7 +66,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.0.2"
+#define APP_VERSION "1.1.0"
 
 /* ---------- 分 P ----------
  * 200 是务实的上限:课程/合集偶尔上百 P,再多就不该在掌机上翻了。
@@ -75,6 +75,11 @@ static char s_status[192] = "";
 #define MAX_PAGES 200
 static BiliPage s_pages[MAX_PAGES];
 static int s_npages = 0;
+/* 给播放器的选集列表。播放器只读不存,所以这两个数组必须活得比播放久 ——
+ * 放文件作用域,别改成栈上的临时变量。 */
+static char  s_pg_label[MAX_PAGES][72];
+static const char *s_pg_labelp[MAX_PAGES];
+static int   s_pg_dur[MAX_PAGES];
 
 static bool g_danmaku = true;       /* 设置:弹幕开关 */
 static int  g_qn = 16;              /* 设置:清晰度 16=360P 32=480P */
@@ -90,17 +95,22 @@ static void set_status(const char *ui_utf8, const char *log_ascii) {
 	if (log_ascii) printf("%s\n", log_ascii);
 }
 
+static void busy_frame(const char *msg);   /* 定义在下面 */
+
 static void load_list(void) {
+	set_status("加载中...", "loading...");
+	/* 【翻页时别清屏】先画一帧:**列表原样留着**,只在下屏状态条上提示。
+	 * 原来这里把整个上屏清成一句「加载中…」,翻一页闪一次白 ——
+	 * 而列表内容其实还在,清掉它只是让人以为东西没了。
+	 * 首次加载是例外(还没有列表可留),那时 draw_list 会居中显示 s_status。 */
+	busy_frame(s_count > 0 ? "加载新一页中..." : "加载中...");
+
 	/* 【顺序要紧】先停封面,再发接口请求。
 	 * 反过来的话,换页时上一页的封面线程会和新的 API 请求并发 ——
 	 * 而「图片请求不与 API 请求同时在飞」正是下面放开图片并发的前提。
-	 * 这个不变式靠调用顺序保证,比靠一把全局大锁便宜得多。 */
+	 * 这个不变式靠调用顺序保证,比靠一把全局大锁便宜得多。
+	 * 放在画帧**之后**:这样那一帧里封面还在,不会先闪掉一排图。 */
 	thumb_stop();
-	set_status("加载中...", "loading...");
-	/* 立即画一帧提示 */
-	ui_begin();
-	ui_text(150, 110, UI_SHARP, UI_COL_DIM, "加载中...");
-	ui_end();
 
 	int r;
 	switch (s_mode) {
@@ -370,15 +380,23 @@ static void draw_top_settings(void) {
 		y += rh + 2.0f;
 	}
 
-	/* 底部两行,从下往上排 —— 上面表格的行数以后要是变了,这里不用跟着改。
+	/* 底部几行从下往上排,每加一行先确认它不会压到上面的表格 ——
+	 * 表格行数以后要是变了,这里会自动少画一行,而不是叠在一起。
+	 * (y 此刻正好是表格底部)
 	 * 版本号在右上角标题栏里已经有了(3Danmu vX.Y.Z),不重复占一行。 */
 	float ly = 240.0f - th_tip - 8.0f;
 	ui_text(PAD, ly, UI_SHARP, UI_COL_DIM, "下屏点按修改  /  B 返回");
-	ly -= th_tip + 5.0f;
+	ly -= th_tip + 4.0f;
 	/* 别再往这一行里塞字了:上屏可用宽度 384px,汉字在清晰档约 18px 一个,
 	 * 21 个字加空格就要溢出。真要加内容就再开一行(表格行高还能收)。 */
 	ui_text(PAD, ly, UI_SHARP, UI_COL_ACCENT,
 	        "仅供学习交流  严禁用于商业用途");
+	/* 作者。只留小红书号 —— 邮箱 22 个字符,加上标签就得单开一行,
+	 * 而这里纵向已经排到底了(见上面的「不压到表格才画」判断)。 */
+	ly -= th_tip + 4.0f;
+	if (ly > y + 2.0f)
+		ui_text(PAD, ly, UI_SHARP, UI_COL_DIM,
+		        "作者小红书 94133173379");
 }
 
 static void draw_bottom_settings(bool touched, float tx, float ty) {
@@ -527,8 +545,26 @@ static void do_login(void) {
 }
 
 /* 阻塞网络操作前调用:立即画一帧,把"正在做什么"刷到状态条上 */
+/* 【换 P 时别退回列表页】置位后 busy_frame 只画一句提示,不画视频列表。
+ * 在播放中换 P,视觉上应该是「同一部片子换一集」,而闪回一整屏列表
+ * 会让人以为已经退出播放了 —— 何况一两秒后又跳回播放器,更乱。 */
+static bool s_busy_minimal = false;
+
 static void busy_frame(const char *msg) {
 	snprintf(s_busy, sizeof(s_busy), "%s", msg);
+	if (s_busy_minimal) {
+		/* 两屏都要画:少画一屏的话,GPU 的两个后台缓冲各留着一份旧内容,
+		 * 表现就是闪烁(这个坑在选集页和调试台那里已经踩过) */
+		ui_begin();
+		float tw = ui_text_width(msg, UI_SHARP);
+		ui_text(200.0f - tw / 2.0f, 112, UI_SHARP, UI_COL_TEXT, msg);
+		if (!ui_console_active()) {
+			ui_begin_bottom();
+			ui_text_clipped(10, 110, UI_SHARP, UI_COL_DIM, msg, 300);
+		}
+		ui_end();
+		return;
+	}
 	draw_list();
 	if (!ui_console_active()) {
 		ListActions dummy = { 0 };
@@ -553,155 +589,18 @@ static void page_label(const BiliPage *pg, char *out, size_t n) {
 	else              snprintf(out, n, "P%d", pg->page);
 }
 
-/* 分P 选择页:上屏放视频标题 + 当前选中项,下屏是可直接点的列表。
- * 返回选中的下标;-1 = 放弃(B / 返回按钮 / 系统要关程序)。
+/* 【选集页已移进播放器】原来这里有一个 choose_page():开播前的独立一页。
+ * 改掉的原因是它决定了上屏能显示什么 —— 跑到那一页时播放器已经退出、
+ * 纹理已经释放,上屏没有画面可留,只能另画一套标题+时长的排版。
+ * 而「换一集」这个动作本来就发生在看片当中,上屏理应停在暂停的那一帧。
  *
- * 【为什么是开播前的独立一页,而不是播放器里的一个按钮】
- * 播放器主循环已经有五个子页面共用同一套触控状态和退出路径,再塞一个
- * 带滚动的列表进去,那几条路径都要跟着分叉 —— 而退出路径正是这个工程
- * 修得最久的一块。何况"看哪一集"本来就是开播**之前**的决定;
- * 看完一 P 回到这一页接着挑,也比在播放中翻列表顺手。 */
-static int choose_page(const BiliVideo *v, int cur) {
-	if (s_npages <= 0) return -1;
-	const float ROWH = 34.0f;
-	const int   VIS  = 5;                   /* 下屏一次显示 5 行 */
-	int sel = (cur >= 0 && cur < s_npages) ? cur : 0;
-	int first = sel - VIS / 2;
-	if (first > s_npages - VIS) first = s_npages - VIS;
-	if (first < 0) first = 0;
+ * 现在它是播放器里的一个子页面(和评论区同构):上屏保持暂停,
+ * 下屏整个换成列表。播放器仍然不碰分P 数据 —— 标签和时长从这里传进去,
+ * 选中后只回一个下标。
+ *
+ * 教训:界面归属不该只看「代码放哪儿更整齐」,还要看**它需要什么上下文**。
+ * 这一页需要的是「视频还在、只是停住了」,那它就只能待在播放器里。 */
 
-	while (aptMainLoop()) {
-		/* 一帧只能 scan 一次(scan 两次会吃掉触摸的按下沿,
-		 * 表现是下屏点不动)——和登录页同一个坑 */
-		hidScanInput();
-		u32 kd = hidKeysDown();
-		touchPosition tp = { 0, 0 };
-		bool touched = (kd & KEY_TOUCH) != 0;
-		if (touched) hidTouchRead(&tp);
-
-		if (kd & KEY_B) return -1;
-		if ((kd & KEY_DOWN) && sel + 1 < s_npages) sel++;
-		if ((kd & KEY_UP)   && sel > 0)            sel--;
-		if (kd & KEY_R) sel += VIS;
-		if (kd & KEY_L) sel -= VIS;
-		if (sel < 0) sel = 0;
-		if (sel >= s_npages) sel = s_npages - 1;
-		if (kd & KEY_A) return sel;
-
-		/* 视口贴边才滚,不是每次都把选中项居中 —— 居中会让上下键
-		 * 时整页一直在动,反而看不出自己走到哪了 */
-		if (sel < first) first = sel;
-		if (sel >= first + VIS) first = sel - VIS + 1;
-		if (first > s_npages - VIS) first = s_npages - VIS;
-		if (first < 0) first = 0;
-
-		/* 和播放/搜索/登录里的子循环一样:系统要关我们时**不能再画帧**,
-		 * ui_end 要等的 VBlank 在退出态可能永远不来(见主循环的说明) */
-		if (net_is_shutting_down() || aptShouldClose()) return -1;
-
-		int picked = -1;
-		float th = ui_text_height(UI_SHARP);
-
-		ui_begin();
-		ui_rect_z(0, 0, 0.6f, 400, 26, UI_COL_ACCENT);
-		ui_text_clipped_z(6, 3, 0.7f, UI_SHARP, UI_COL_WHITE, v->title, 388);
-		{
-			float y = 42.0f;
-			char buf[64];
-			snprintf(buf, sizeof(buf), "共 %d 个分P", s_npages);
-			ui_text(16, y, UI_SHARP, UI_COL_DIM, buf);
-			y += th + 12.0f;
-			char lb[160];
-			page_label(&s_pages[sel], lb, sizeof(lb));
-			ui_rect(16, y - 5, 368, th + 10, UI_COL_SEL);
-			ui_rect(16, y - 5, 3, th + 10, UI_COL_ACCENT);
-			ui_text_clipped(26, y, UI_SHARP, UI_COL_WHITE, lb, 350);
-			y += th + 22.0f;
-			if (s_pages[sel].duration > 0) {
-				snprintf(buf, sizeof(buf), "时长 %d:%02d",
-				         s_pages[sel].duration / 60,
-				         s_pages[sel].duration % 60);
-				ui_text(16, y, UI_SHARP, UI_COL_DIM, buf);
-			}
-			/* 上一次开播失败的原因(取流失败/需登录…)。play_stream 成功时
-			 * 会把 s_busy 清掉,所以这里有字就一定是刚才那次没播成 ——
-			 * 不显示的话,用户点了一下又回到这一页,看着像"没反应" */
-			if (s_busy[0])
-				ui_text_clipped(16, 190, UI_SHARP, UI_COL_ACCENT,
-				                s_busy, 368);
-			ui_text(16, 214, UI_SHARP, UI_COL_DIM,
-			        "十字键选择  A 播放  L/R 翻页  B 返回");
-		}
-
-		if (!ui_console_active()) {
-			ui_begin_bottom();
-			ui_rect(0, 0, 320, 22, UI_COL_ACCENT);
-			char hdr[64];
-			snprintf(hdr, sizeof(hdr), "选集  %d/%d", sel + 1, s_npages);
-			ui_text(8, (22.0f - th) / 2.0f, UI_SHARP, UI_COL_WHITE, hdr);
-			for (int k = 0; k < VIS; k++) {
-				int i = first + k;
-				if (i >= s_npages) break;
-				float y = 24.0f + k * ROWH;
-				float h = ROWH - 2.0f;
-				/* 点一下就播:多 P 视频里"选中"和"播放"是同一个意图,
-				 * 分两步只是多点一次 */
-				bool hit = touched && tp.px >= 6 && tp.px < 302 &&
-				           tp.py >= y && tp.py < y + h;
-				if (hit) { sel = i; picked = i; }
-				ui_rect(6, y, 296, h, (i == sel) ? UI_COL_ACCENT : UI_COL_SEL);
-				char lb[160], db[16];
-				page_label(&s_pages[i], lb, sizeof(lb));
-				float ty = y + (h - th) / 2.0f;
-				float dw = 0.0f;                    /* 时长占掉的右侧宽度 */
-				if (s_pages[i].duration > 0) {
-					snprintf(db, sizeof(db), "%d:%02d",
-					         s_pages[i].duration / 60,
-					         s_pages[i].duration % 60);
-					dw = ui_text_width(db, UI_SHARP);
-					/* 选中行底色是 ACCENT,DIM 压在上面几乎看不见 */
-					ui_text(296.0f - dw, ty, UI_SHARP,
-					        (i == sel) ? UI_COL_WHITE : UI_COL_DIM, db);
-					dw += 10.0f;                    /* 和标题留条缝 */
-				}
-				ui_text_clipped(14, ty, UI_SHARP, UI_COL_WHITE,
-				                lb, 282.0f - dw);
-			}
-			if (s_npages > VIS) {          /* 滚动条 */
-				float track = VIS * ROWH;
-				float bh = track * (float)VIS / (float)s_npages;
-				if (bh < 12.0f) bh = 12.0f;
-				float pos = (float)first / (float)(s_npages - VIS);
-				ui_rect(306, 24, 6, track, C2D_Color32(0x30, 0x30, 0x3C, 0xFF));
-				ui_rect(306, 24 + (track - bh) * pos, 6, bh, UI_COL_ACCENT);
-			}
-			if (ui_button(10, 198, 86, 36, "返回", UI_COL_SEL,
-			              touched, tp.px, tp.py))
-				picked = -2;
-			if (ui_button(104, 198, 100, 36, "上一页", UI_COL_SEL,
-			              touched, tp.px, tp.py))
-				sel -= VIS;
-			if (ui_button(210, 198, 100, 36, "下一页", UI_COL_SEL,
-			              touched, tp.px, tp.py))
-				sel += VIS;
-		} else {
-			/* 调试台开着时照样把它画出来 —— 不画的话下屏这一帧没人清,
-			 * GPU 两个后台缓冲各留着一份旧内容,表现就是闪烁 */
-			touchPosition th2;
-			hidTouchRead(&th2);
-			if (ui_draw_log(touched, (hidKeysHeld() & KEY_TOUCH) != 0,
-			                th2.px, th2.py))
-				ui_bottom_debug(false);
-		}
-		ui_end();
-
-		if (picked == -2) return -1;
-		if (picked >= 0) return picked;
-		if (sel < 0) sel = 0;
-		if (sel >= s_npages) sel = s_npages - 1;
-	}
-	return -1;
-}
 
 /* 真正开播一条流。cid 由调用方给 —— 多 P 视频必须传**选中那一 P**的 cid,
  * 弹幕、字幕、进度上报全按 cid 走,只有它换对了才是真的换了一集。 */
@@ -794,29 +693,51 @@ static void play_selected(void) {
 	}
 
 	if (s_npages > 1) {
-		/* 进来时高亮和列表里那个 cid 对得上的一 P(通常是 P1);
-		 * 看完一 P 回到这一页时停在刚看过的那一项,接着往下挑 */
+		/* 选集列表交给播放器画(上屏要保持暂停的画面,所以它必须在
+		 * 播放器**里面**)。这两个数组是文件作用域的,播放期间一直有效 ——
+		 * 播放器只读不存,别改成栈上的。 */
+		for (int i = 0; i < s_npages; i++) {
+			page_label(&s_pages[i], s_pg_label[i], sizeof(s_pg_label[i]));
+			s_pg_labelp[i] = s_pg_label[i];
+			s_pg_dur[i] = s_pages[i].duration;
+		}
+	}
+
+	if (s_npages > 1) {
+		/* 【直接播,不先问】多 P 视频进来就放第一 P(或列表里那个 cid
+		 * 对得上的一 P)。开播前横插一个选集页,对「点进去就想看」这个
+		 * 最常见的意图是纯粹的摩擦 —— 而绝大多数人点进合集就是从头看。
+		 * 想换 P 的,播放中下屏左下角有「选集」按钮。 */
 		int cur = 0;
 		for (int i = 0; i < s_npages; i++)
 			if (s_pages[i].cid == v->cid) { cur = i; break; }
-		while (1) {
-			int pick = choose_page(v, cur);
-			if (pick < 0) break;
-			cur = pick;
+		for (;;) {
 			char t[220];
-			if (s_pages[pick].title[0])
+			if (s_pages[cur].title[0])
 				snprintf(t, sizeof(t), "P%d %s | %s",
-				         s_pages[pick].page, s_pages[pick].title, v->title);
+				         s_pages[cur].page, s_pages[cur].title, v->title);
 			else
 				snprintf(t, sizeof(t), "P%d | %s",
-				         s_pages[pick].page, v->title);
-			play_stream(v, s_pages[pick].cid, t);
-			/* 系统要关我们:别再回选集页了,那里还要画帧 */
+				         s_pages[cur].page, v->title);
+			player_set_pages(s_pg_labelp, s_pg_dur, s_npages, cur);
+			play_stream(v, s_pages[cur].cid, t);
+			/* 【只有在选集里挑了才继续】按 B 退出播放器是「我看完了」,
+			 * 不是「我要挑下一集」—— 以前播完无条件弹选集页,
+			 * 想走的人得按两次 B。 */
+			int pick = player_take_page_pick();
+			if (pick < 0) break;
+			/* 系统要关我们:别再开下一段流了 */
 			if (net_is_shutting_down() || aptShouldClose()) break;
+			cur = pick;
+			/* 从第二段起就是「换一集」而不是「开始看」,取流期间
+			 * 上屏别退回列表页 */
+			s_busy_minimal = true;
 		}
+		s_busy_minimal = false;
 	} else {
 		play_stream(v, v->cid, v->title);
 	}
+	player_set_pages(NULL, NULL, 0, 0);
 
 	/* 【系统正在关我们时别再启动封面下载】否则刚被掐掉的两个 loader 线程
 	 * 立刻又被拉起来,接着 thumb_exit 还得把它们收一遍 —— 白白拖长

@@ -227,6 +227,36 @@ static u32 s_player_clock_ms = 0;   /* 供退出时补报进度 */
 static char s_toast[128] = "";      /* 上屏浮层提示(发弹幕结果等) */
 static u64  s_toast_until = 0;
 static bool (*s_login_cb)(void) = NULL;
+
+/* ---------- 分 P ----------
+ * 【为什么选集在播放器**里面**】
+ * 第一版把它做成开播前的独立一页(在 main.c),理由是不想往播放器主循环
+ * 里再塞一个带滚动的列表 —— 那里已经有五个子页面共用同一套触控和退出路径。
+ * 但那样一来,选集时上屏没有画面可留(播放器已退出、纹理已释放),
+ * 而「换一集」这个动作本来就发生在看片当中,上屏理应停在暂停的那一帧。
+ *
+ * 所以改成和评论区同样的子页面:上屏视频保持暂停,下屏整个换成列表。
+ * 播放器仍然不碰分P 的数据 —— 标签和时长由 main.c 传进来,
+ * 选中后只回一个下标,重新取流还是 main.c 的事。 */
+static const char *const *s_pg_labels = NULL;
+static const int         *s_pg_durs   = NULL;
+static int  s_pg_n   = 0;      /* 共几 P(<=1 不显示选集) */
+static int  s_pg_cur = 0;      /* 当前是第几 P(下标) */
+static int  s_page_pick = -1;  /* 用户选中的下标;-1 = 没选 */
+
+void player_set_pages(const char *const *labels, const int *durations,
+                      int n, int cur) {
+	s_pg_labels = labels;
+	s_pg_durs   = durations;
+	s_pg_n      = n;
+	s_pg_cur    = cur;
+}
+
+int player_take_page_pick(void) {
+	int p = s_page_pick;
+	s_page_pick = -1;   /* 取走即清:一次性的意图,不是状态 */
+	return p;
+}
 static bool s_pref_sub = false;    /* CC 字幕开关 */
 /* 默认中档:中档(0.52)正好落在 eff_scale 的吸附窗口里,是三档里唯一
  * 锐利的一档。小/大两档刻意取在窗口外 —— 用户选它们要的就是尺寸不同,
@@ -360,9 +390,16 @@ static void downloader_main(void *arg) {
 			r->wr += (u32)n;
 			last_read_ms = osGetTime();
 		} else {
-			/* 读到 0 且已到文件末尾 = 真 EOF;否则当断线处理 */
+			/* 【判 EOF 要先看位置,再看返回值】
+			 * 原来的判据是「n==0 **且** 已到末尾」。可是拖到片尾时
+			 * ns_read 往往是**报错**(n<0)而不是返回 0 —— 于是明明
+			 * pos=100% 却被当成断线,拿一个超出文件长度的 Range 去重连,
+			 * 服务端只会一直拒绝(实测连失败 5 次),而这期间解封装器
+			 * 拿到的是残缺数据,最后喂给 MVD 一个 41 字节的 AU 把它搞崩。
+			 * 已经读完了就是读完了,这跟连接出没出错无关。 */
 			u64 wpos = r->base + r->wr;
-			bool true_eof = (n == 0) && (!r->total || wpos >= r->total);
+			bool true_eof = (r->total && wpos >= r->total) ||
+			                (n == 0 && !r->total);
 			if (true_eof) {
 				r->eof = 1;
 			} else {
@@ -1223,6 +1260,24 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 				off += sz;
 				so += sz;
 			}
+			/* 【残缺的 AU 绝不能送进 MVD】
+			 * mvd 是**系统模块**,喂它半截数据不是我们崩,是它崩 ——
+			 * 整机蓝屏,而且 PC 落在它自己的代码里,addr2line 都用不上。
+			 * 实测现场:拖到片尾触发重连风暴,解封装器吐出一个 41 字节的
+			 * 包(正常是 22~30KB),送进去当场 svcBreak。
+			 *
+			 * 判据是「装得下一帧吗」而不是「解析出错了吗」:上面那个
+			 * while 循环对残缺数据是**静默 break**的,出不出错它都不说话,
+			 * 所以只能从结果的大小上认。参数集本身约 32 字节,
+			 * 一个真正的视频帧再小也不会只有几十字节。 */
+			if (off < 128) {
+				printf("mvd: skip runt AU %luB (truncated stream?)\n",
+				       (unsigned long)off);
+				/* 跳过之后解码器缺了这一段,下次必须重新带参数集,
+				 * 否则它会拿着对不上的参考帧继续解 */
+				p->mvd_need_hdr = true;
+				break;
+			}
 			GSPGPU_FlushDataCache(p->mvd_in, off);
 			bool first = p->mvd_first;
 			/* 只在首帧同步落盘:mvd 若在这里崩,异步队列来不及写出去。
@@ -1949,6 +2004,10 @@ static void player_cleanup(Player *p) {
 static int player_play_inner(const char *url, const char *title);
 
 int player_play(const char *url, const char *title) {
+	/* 【进来先清】没清的话,上一次没被消费掉的选集结果会活到这一次,
+	 * 一进播放就自己退出去换 P。s_suspend_req 刚犯过同样的错:
+	 * 一个只在某处消费的标志,必须在每次进入那个上下文时归零。 */
+	s_page_pick = -1;
 	/* 每个新视频都重新试一次硬解。除非已经连续失败太多次 —— 那多半是
 	 * mvd 系统模块本身状态不对了,继续初始化它风险大于收益 */
 	if (s_mvd_fail_streak >= MVD_FAIL_GIVEUP) {
@@ -2209,6 +2268,19 @@ static int player_play_inner(const char *url, const char *title) {
 		bool dragging = false;
 		bool in_psettings = false;   /* 播放设置子页 */
 		bool in_comments = false;   /* 评论区子页(视频照常播) */
+		bool in_pages = false;      /* 选集子页(视频暂停,上屏留住画面) */
+		/* 【选集是纯触屏页】滚动改成像素级,靠手指拖 —— 按行翻页在
+		 * 上百 P 的合集里要点几十次。摇杆和十字键在这一页**不接管**:
+		 * 它们在播放页是别的用途(方向键调进度、摇杆没占用),
+		 * 同一个键在两个上下文做不同的事只会误触。 */
+		float pg_scroll = 0.0f;     /* 列表滚动偏移(像素) */
+		bool  pg_drag = false;      /* 正在拖列表 */
+		bool  pg_bardrag = false;   /* 正在拖右侧滚动条 */
+		float pg_touch_y0 = 0.0f;   /* 按下时的触点 y */
+		float pg_scroll0 = 0.0f;    /* 按下时的滚动位置 */
+		float pg_moved = 0.0f;      /* 本次触摸的最大偏移(判定点按还是拖动) */
+		/* 最后一次有效触点。松手帧 hidTouchRead 拿不到坐标,只能自己留一份 */
+		float pg_last_x = 0.0f, pg_last_y = 0.0f;
 		int  sub_tries = 0;          /* 字幕已尝试次数(AI 字幕要等它生成) */
 		u64  sub_kick_t0 = 0;
 		bool want_console = false;   /* 帧外切调试台(帧内切会花屏) */
@@ -2287,7 +2359,8 @@ static int player_play_inner(const char *url, const char *title) {
 			if (holding) hidTouchRead(&tp);
 
 			if (kDown & KEY_B) {
-				if (in_comments) { in_comments = false; }
+				if (in_pages) { in_pages = false; }
+				else if (in_comments) { in_comments = false; }
 				else if (in_psettings) { in_psettings = false; }
 				else { p->quit = 1; ret = 0; break; }
 			}
@@ -2494,7 +2567,151 @@ static int player_play_inner(const char *url, const char *title) {
 				}
 			}
 			bool btn_touch = touched && !dragging;
-			if (in_comments && !ui_console_active()) {
+			if (in_pages && !ui_console_active()) {
+				/* 选集子页:上屏保持暂停的画面,下屏整个换成列表。
+				 * **纯触屏**:拖动滚动、点按换 P、右侧滚动条可拖。
+				 * 不接管摇杆和十字键 —— 那两个在播放页另有用途。 */
+				const float ROWH = 34.0f;
+				const float LX = 6.0f, LW = 296.0f;
+				const float LY = 24.0f;
+				const float BAR_X = 306.0f, BAR_W = 8.0f;
+				float th = ui_text_height(UI_SHARP);
+				/* 可视区高度由底部那两行倒推,不写死 ——
+				 * 写死 170 的那一版,说明行正好落进了列表区里。
+				 * 底部布局:状态条 (th+8) 高、离屏底 2;说明行在它上面 5px。 */
+				float bar_h = th + 8.0f;
+				float bar_y = 240.0f - bar_h - 2.0f;
+				float hint_y = bar_y - th - 5.0f;
+				float LH = hint_y - 4.0f - LY;
+				float maxscroll = s_pg_n * ROWH - LH;
+				if (maxscroll < 0) maxscroll = 0;
+
+				/* ---- 触摸 ----
+				 * 【坐标必须自己记住】hidTouchRead 只在按住期间有效,
+				 * **松手那一帧 tp 已经是 (0,0)** —— 而点选正是在松手时判定的。
+				 * 直接用 tp 的话,命中测试永远落在左上角,一行都点不中。 */
+				if (touched) {
+					pg_moved = 0.0f;
+					pg_touch_y0 = tp.py;
+					pg_scroll0 = pg_scroll;
+					pg_last_x = tp.px;
+					pg_last_y = tp.py;
+					pg_bardrag = (tp.px >= BAR_X - 6 && maxscroll > 0);
+					pg_drag = !pg_bardrag && tp.py >= LY && tp.py < LY + LH;
+					if (pg_bardrag) {   /* 点滚动条:直接跳到该位置 */
+						float rel = (tp.py - LY) / LH;
+						pg_scroll = rel * maxscroll;
+					}
+				}
+				if (holding) {
+					pg_last_x = tp.px;
+					pg_last_y = tp.py;
+					float dy = tp.py - pg_touch_y0;
+					float ady = dy < 0 ? -dy : dy;
+					/* 记**最大偏移**而不是累加:累加的话按住不动时,
+					 * 每帧几像素的抖动也会攒成"拖动过",于是点不动 */
+					if (ady > pg_moved) pg_moved = ady;
+					if (pg_bardrag) {
+						float rel = (tp.py - LY) / LH;
+						pg_scroll = rel * maxscroll;
+					} else if (pg_drag) {
+						pg_scroll = pg_scroll0 - dy;
+					}
+				}
+				bool pg_released = (kUp & KEY_TOUCH) != 0;
+				if (!holding) { pg_drag = false; pg_bardrag = false; }
+				if (pg_scroll < 0) pg_scroll = 0;
+				if (pg_scroll > maxscroll) pg_scroll = maxscroll;
+
+				ui_begin_bottom();
+				ui_rect(0, 0, 320, 22, UI_COL_ACCENT);
+				char hdr[64];
+				snprintf(hdr, sizeof(hdr), "选集  当前 P%d / 共 %d",
+				         s_pg_cur + 1, s_pg_n);
+				ui_text(8, (22.0f - th) / 2.0f, UI_SHARP, UI_COL_WHITE, hdr);
+
+				/* ---- 列表 ---- */
+				ui_clip(LX, LY, LW + 4.0f, LH);
+				int kfirst = (int)(pg_scroll / ROWH);
+				if (kfirst < 0) kfirst = 0;
+				for (int i = kfirst; i < s_pg_n; i++) {
+					float y = (float)(int)(LY + i * ROWH - pg_scroll);
+					if (y >= LY + LH) break;
+					float h = ROWH - 2.0f;
+					/* 【点按 ≠ 拖动】松手时移动量还很小才算点选,
+					 * 否则「滑到一半松手」会误触发换 P。 */
+					bool tap = pg_released && pg_moved < 8.0f &&
+					           pg_last_x >= LX && pg_last_x < LX + LW &&
+					           pg_last_y >= y && pg_last_y < y + h &&
+					           pg_last_y >= LY && pg_last_y < LY + LH;
+					if (tap && i != s_pg_cur) {
+						/* 换 P:退出播放,由 main.c 拿着下标重新取流 */
+						s_page_pick = i;
+						p->quit = 1;
+					}
+					/* 点当前这一 P:不是要换,是「就看这个」—— 关掉面板 */
+					if (tap && i == s_pg_cur) in_pages = false;
+					/* 【当前 P 不高亮】哪一 P 在放,底部状态条已经写着了;
+					 * 列表里再标一次只是让人以为「这一行被选中了」——
+					 * 而这一页里唯一的选中动作就是点按本身。 */
+					ui_rect(LX, y, LW, h, UI_COL_SEL);
+					/* 按下反馈:和 ui_button 同款白边。
+					 * 但这里**按住期间一直显示**,而不是像按钮那样只闪一帧 ——
+					 * 这一页要拖要滑,手指在屏幕上停留的时间长得多,
+					 * 一帧的反馈根本看不见。移动超过阈值就撤掉:
+					 * 那时已经是在拖列表,不再是要点这一行。 */
+					if (holding && pg_moved < 8.0f && !pg_bardrag &&
+					    pg_last_x >= LX && pg_last_x < LX + LW &&
+					    pg_last_y >= y && pg_last_y < y + h &&
+					    pg_last_y >= LY && pg_last_y < LY + LH) {
+						ui_rect(LX, y, LW, 2, UI_COL_WHITE);
+						ui_rect(LX, y + h - 2, LW, 2, UI_COL_WHITE);
+						ui_rect(LX, y, 2, h, UI_COL_WHITE);
+						ui_rect(LX + LW - 2, y, 2, h, UI_COL_WHITE);
+					}
+					float ty = y + (h - th) / 2.0f;
+					float dw = 0.0f;
+					if (s_pg_durs && s_pg_durs[i] > 0) {
+						char db[16];
+						snprintf(db, sizeof(db), "%d:%02d",
+						         s_pg_durs[i] / 60, s_pg_durs[i] % 60);
+						dw = ui_text_width(db, UI_SHARP);
+						ui_text(LX + LW - 6.0f - dw, ty, UI_SHARP,
+						        UI_COL_DIM, db);
+						dw += 10.0f;
+					}
+					ui_text_clipped(LX + 8.0f, ty, UI_SHARP, UI_COL_WHITE,
+					                s_pg_labels[i], LW - 16.0f - dw);
+				}
+				ui_unclip();
+
+				/* ---- 右侧滚动条(可拖) ---- */
+				if (maxscroll > 0) {
+					float bh = LH * LH / (s_pg_n * ROWH);
+					if (bh < 16.0f) bh = 16.0f;
+					float pos = pg_scroll / maxscroll;
+					ui_rect(BAR_X, LY, BAR_W, LH,
+					        C2D_Color32(0x30, 0x30, 0x3C, 0xFF));
+					ui_rect(BAR_X, LY + (LH - bh) * pos, BAR_W, bh,
+					        pg_bardrag ? UI_COL_WHITE : UI_COL_ACCENT);
+				}
+
+				/* ---- 按键说明 + 状态条 ----
+				 * 位置全部由实测行高推,别写死 y ——
+				 * 写死过一次,说明行的下沿正好压在状态条的底色上。 */
+				{
+					ui_text(8, hint_y, UI_SHARP, UI_COL_DIM,
+					        "滑动翻找   点按播放   B 返回");
+					ui_rect(6, bar_y, 308, bar_h,
+					        C2D_Color32(0x26, 0x26, 0x30, 0xFF));
+					char sb[96];
+					snprintf(sb, sizeof(sb), "正在播放:%s",
+					         (s_pg_cur >= 0 && s_pg_cur < s_pg_n)
+					         ? s_pg_labels[s_pg_cur] : "");
+					ui_text_clipped(14, bar_y + 4.0f, UI_SHARP,
+					                UI_COL_WHITE, sb, 292);
+				}
+			} else if (in_comments && !ui_console_active()) {
 				/* 评论区子页:占满下屏,上屏视频照常播、弹幕照常飘。
 				 * 触屏只管拖动滚屏,滚到底自动续下一页;关闭走 B。
 				 * 下屏不放按钮 —— 按钮行会把底部提示挤远 */
@@ -2567,9 +2784,11 @@ static int player_play_inner(const char *url, const char *title) {
 					char ab[32];
 					snprintf(ab, sizeof(ab), "画面比例:%s",
 					         ASPECTS[s_pref_aspect].name);
+					/* 【不按值高亮】按钮上写着当前值,高亮不提供任何额外信息,
+					 * 只是让「非默认」看起来像「开启了什么」。同一行里
+					 * 3D 那个是真·开关(开着会影响画面),那种才该高亮。 */
 					if (ui_button(10, PS_Y(2), 145, PS_H, ab,
-					              s_pref_aspect ? UI_COL_ACCENT : UI_COL_SEL,
-					              btn_touch, tp.px, tp.py)) {
+					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 						s_pref_aspect = (s_pref_aspect + 1) % ASPECT_N;
 						settings_set("aspect", s_pref_aspect);
 						calc_output_size(p);
@@ -2581,8 +2800,7 @@ static int player_play_inner(const char *url, const char *title) {
 					                             "弹幕范围:1/4",
 					                             "弹幕范围:1/8" };
 					if (ui_button(165, PS_Y(2), 145, PS_H, ar[s_dm_area],
-					              s_dm_area ? UI_COL_ACCENT : UI_COL_SEL,
-					              btn_touch, tp.px, tp.py)) {
+					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 						s_dm_area = (s_dm_area + 1) % 4;
 						settings_set("dm_area", s_dm_area);
 						dm_set_area(s_dm_area);
@@ -2704,8 +2922,27 @@ static int player_play_inner(const char *url, const char *title) {
 						ui_text_z(bx, BAR_Y - 33, 0.7f, UI_SHARP, UI_COL_WHITE, db);
 					}
 				}
-				if (ui_button(10, 50, 96, 40, "返回", UI_COL_SEL,
-				              btn_touch, tp.px, tp.py)) { p->quit = 1; ret = 0; }
+				/* 多 P 视频:这个位置放「选集」而不是「返回」。
+				 * 返回本来就有 B 键(下面那行提示里写着),而选集在播放中
+				 * 是没有别的入口的 —— 把唯一没有替代品的功能放在按钮上。
+				 * 单 P 视频照旧显示「返回」:这时选集按钮点了也没意义。 */
+				if (s_pg_n > 1) {
+					if (ui_button(10, 50, 96, 40, "选集", UI_COL_SEL,
+					              btn_touch, tp.px, tp.py)) {
+						in_pages = true;
+						/* 打开时把当前这一 P 大致居中,免得还要自己滑去找 */
+						pg_scroll = (float)s_pg_cur * 34.0f - 68.0f;
+						if (pg_scroll < 0) pg_scroll = 0;
+						pg_drag = pg_bardrag = false;
+						pg_moved = 0.0f;
+						/* 【不暂停】和评论区一致:上屏照常播,下屏翻列表。
+						 * 双屏机器上「上面放着、下面操作」本来就是最自然的
+						 * 用法,为翻个列表把视频停掉反而多此一举。 */
+					}
+				} else if (ui_button(10, 50, 96, 40, "返回", UI_COL_SEL,
+				                     btn_touch, tp.px, tp.py)) {
+					p->quit = 1; ret = 0;
+				}
 				if (ui_button(112, 50, 96, 40, p->pause ? "播放" : "暂停",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) do_pause = true;
 				if (ui_button(214, 50, 96, 40, "设置", UI_COL_SEL,

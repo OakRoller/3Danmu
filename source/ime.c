@@ -255,11 +255,13 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 		ui_begin();
 		/* 上屏:提示 + 当前文本(大字预览) */
 		ui_text(10, 8, UI_SHARP, UI_COL_DIM, hint ? hint : "输入");
-		/* 大字预览特意保留 0.85:按当前字体的标定(sharp≈0.87),它落在
-		 * 吸附窗口里、被吸到精确 1.0 —— 是全程序里少数真正 1:1 渲染的字,
-		 * 又大又锐。若哪天按 sharp=52 重转字体,这里要跟着改小,
-		 * 否则会变成 1.6 倍放大。 */
-		ui_text(10, 38, 0.85f, UI_COL_TEXT, text[0] ? text : "…");
+		/* 【这里曾经写死 0.85】当时的理由是:按那版字体的标定(sharp≈0.87)
+		 * 0.85 落在吸附窗口里、会被吸到精确 1.0,所以又大又锐。
+		 * 但字体后来重转过,UI_SHARP 现在是 0.52 —— 0.85 早就不在窗口里了,
+		 * 于是变成 1.6 倍放大,正在输入的字反而是全屏最糊的。
+		 * 教训:把「当前标定值」抄成字面量,标定一变它就成了错的,
+		 * 而且**不会报错,只会变糊**。跟着 UI_SHARP 走,别再写死。 */
+		ui_text(10, 38, UI_SHARP, UI_COL_TEXT, text[0] ? text : "…");
 		if (pylen)
 			ui_text(10, 84, UI_SHARP, UI_COL_ACCENT, py);
 		ui_text(10, 202, UI_SHARP, UI_COL_DIM,
@@ -314,17 +316,10 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 					cstack[cdepth++] = base;
 				cbase = base + drawn;
 			}
-			/* 页码提示:有多少候选、看到第几个 —— 不然用户不知道还有没有 */
-			if (ncand > drawn) {
-				/* 缓冲要按**格式串的最坏情况**算,不是按实际值算:
-				 * 三个 int 各最长 11 字符 + 2 个分隔符 + 结尾 0 = 36。
-				 * 编译器只看类型不看取值范围(这里其实都 < 100),
-				 * 给够就没警告 —— 别用 (int) 强转去糊弄它。 */
-				char pg[40];
-				snprintf(pg, sizeof(pg), "%d-%d/%d",
-				         base + 1, base + drawn, ncand);
-				ui_text(4, 66, UI_SHARP, UI_COL_DIM, pg);
-			}
+			/* 【页码提示已去掉】曾经在这里画 "1-6/48"。
+			 * 本意是让用户知道后面还有候选,但 < > 两个翻页键本身就说明了
+			 * 这件事,而具体数字对「挑一个字」这个动作没有任何用 ——
+			 * 它只是占着候选行下方的位置,还多一行要读的东西。 */
 		}
 		/* 键面自绘:ui_button 的 0.7 字号会从 30px 的小键里溢出去,
 		 * 看着就"和触控区对不上"。这里用 0.58 并按住高亮命中键 */

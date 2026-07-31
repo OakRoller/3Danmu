@@ -9,6 +9,16 @@
  * New3DS 优先使用 MVD 硬件解码,失败自动退回软解。 */
 int player_play(const char *url, const char *title);
 
+/* 分P。labels/durations 由调用方保管(播放期间必须一直有效),
+ * 播放器只读不存。n>1 时下屏左下角的「返回」换成「选集」——
+ * 返回本来就有 B 键,而选集在播放中没有别的入口。
+ * 选集子页里上屏保持暂停,下屏换成列表。 */
+void player_set_pages(const char *const *labels, const int *durations,
+                      int n, int cur);
+/* 播放结束后问一次:用户在选集里挑了哪一 P(-1 = 没挑,正常退出)。
+ * 取走即清。重新取流由 main.c 负责 —— 播放器不碰分P 的数据。 */
+int  player_take_page_pick(void);
+
 /* 播放偏好(由设置页控制) */
 void player_set_prefs(bool danmaku_on, bool force_sw, int qn);
 /* 开机调一次:从 SD 存档恢复字幕开关和弹幕/字幕字号 */
