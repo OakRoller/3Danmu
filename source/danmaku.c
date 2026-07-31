@@ -33,7 +33,10 @@ static Thread s_thread = NULL;
 static int64_t s_pending_cid = 0;
 static float s_scale = 0.52f; /* 字号(dm_set_size)。0.52 = 清晰档,见 ui.c eff_scale */
 static float s_row_h = 16.0f;
-static int   s_rows  = 14;    /* 滚动行数 = 234/行高,随字号变,铺满全屏 */
+static int   s_rows  = 14;    /* 滚动行数 = 可用高度/行高,随字号与覆盖范围变 */
+/* 覆盖范围档位:0=全屏 1=1/2 2=1/4 3=1/8(从顶部往下算) */
+static int   s_area  = 0;
+static const float DM_AREA_FRAC[4] = { 1.0f, 0.5f, 0.25f, 0.125f };
 static int s_cursor = 0;      /* 第一个可能仍在屏上的下标 */
 static double s_last_clock = 0;
 static volatile int s_fresh = 0;   /* 刚发布新数据,首次绘制要对齐当前时刻 */
@@ -63,6 +66,37 @@ static bool  s_row_used[DM_MAX_ROWS];
 static void rows_clear(void) {
 	for (int i = 0; i < DM_MAX_ROWS; i++) s_row_used[i] = false;
 }
+
+/* 行数 = 可用高度 / 行高。可用高度 = 上屏 234px x 覆盖范围。
+ * 【为什么允许只剩 1 行】1/8 屏(约 29px)在大字号下就只装得下一行 ——
+ * 那正是用户选它的本意。旧代码的下限 4 会让 1/4 和 1/8 变成同一档。 */
+static void rows_recalc(void) {
+	float avail = 234.0f * DM_AREA_FRAC[s_area];
+	int n = (s_row_h > 1.0f) ? (int)(avail / s_row_h) : 1;
+	if (n < 1) n = 1;
+	if (n > DM_MAX_ROWS) n = DM_MAX_ROWS;
+	s_rows = n;
+}
+
+/* 行数变了:旧行号可能已超出新行数(会画到范围外),全部作废重排 */
+static void rows_reassign(void) {
+	for (int i = 0; i < s_count; i++) s_items[i].row = 0xFF;
+	for (int i = 0; i < s_nlocal; i++) s_local[i].row = 0xFF;
+	rows_clear();
+}
+
+/* 字号 / 覆盖范围任何一边动了都走这里。
+ * 【必须无条件重算一次,不能"值没变就早退"】s_rows 的静态初值 14 和
+ * 234/19=12 对不上,而默认档(中号 + 全屏)恰好两边都"没变" ——
+ * 早退就把这次校正一起跳过了,最底下两行画在 y=230/249,
+ * 也就是**屏幕外**。落在那两行的弹幕从来没人见过。 */
+static void layout_apply(void) {
+	int old = s_rows;
+	rows_recalc();
+	if (old != s_rows) rows_reassign();
+}
+
+int dm_rows(void) { return s_rows; }
 
 int dm_count(void) { return s_count; }
 bool dm_loading(void) { return s_loading != 0; }
@@ -310,22 +344,25 @@ void dm_set_size(int level) {
 	 * 【行高必须按"吸附后"的实际字高算】曾经行高用原始 0.45 算而字形被
 	 * 吸附放大画,行装不下字 —— 挤行。现在中档行高按 1:1 字高给。 */
 	float sc = (level <= 0) ? 0.39f : (level >= 2) ? 0.78f : 0.52f;
-	if (sc == s_scale) return;
-	s_scale = sc;
-	s_row_h = 19.0f * (sc / 0.52f);
-	s_rows = (int)(234.0f / s_row_h);      /* 任何字号都铺满全屏高度 */
-	if (s_rows > DM_MAX_ROWS) s_rows = DM_MAX_ROWS;
-	if (s_rows < 4) s_rows = 4;
-	/* 字号变了:宽度缓存作废,行号重排(旧行号可能超出新行数) */
-	for (int i = 0; i < s_count; i++) {
-		s_items[i].w = -1.0f;
-		s_items[i].row = 0xFF;
+	if (sc != s_scale) {
+		s_scale = sc;
+		s_row_h = 19.0f * (sc / 0.52f);
+		/* 字号变了:宽度缓存作废,行号一定要重排(行高跟着变了) */
+		for (int i = 0; i < s_count; i++) s_items[i].w = -1.0f;
+		for (int i = 0; i < s_nlocal; i++) s_local[i].w = -1.0f;
+		rows_recalc();
+		rows_reassign();
+		return;
 	}
-	for (int i = 0; i < s_nlocal; i++) {
-		s_local[i].w = -1.0f;
-		s_local[i].row = 0xFF;
-	}
-	rows_clear();
+	layout_apply();
+}
+
+void dm_set_area(int level) {
+	if (level < 0) level = 0;
+	if (level > 3) level = 3;
+	s_area = level;
+	/* 只动行数,字宽不受影响 —— 别把宽度缓存也清了,那是几百次字形解析 */
+	layout_apply();
 }
 
 void dm_reset(void) {
@@ -353,8 +390,13 @@ static void draw_local(double clock, float xoff) {
 }
 
 void dm_draw(double clock, float xoff) {
+	/* 【这一路不加重】界面文字画两遍是为了补 12px 汉字的半格墨,
+	 * 但弹幕单帧上限 80 条、3D 还要双眼各来一遍 —— 加倍会顶穿 citro2d
+	 * 的顶点预算,而顶穿之后是**静默丢绘制**(画面残缺,且很难归因)。
+	 * 弹幕本来就在动、也不用逐字细读,少这一遍看不出来。 */
+	ui_text_boost(false);
 	draw_local(clock, xoff);
-	if (!s_items || s_count == 0) return;
+	if (!s_items || s_count == 0) { ui_text_boost(true); return; }
 
 	if (s_fresh) {
 		/* 数据刚发布:从头重扫、清空行占用。
@@ -407,4 +449,5 @@ void dm_draw(double clock, float xoff) {
 		ui_text(x + xoff, 2.0f + it->row * s_row_h, s_scale, it->color, it->text);
 		drawn++;
 	}
+	ui_text_boost(true);
 }

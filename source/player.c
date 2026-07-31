@@ -233,6 +233,55 @@ static bool s_pref_sub = false;    /* CC 字幕开关 */
  * 发虚是明码标价的代价。 */
 static int  s_dm_size = 1;         /* 弹幕字号 0小 1中 2大(默认中) */
 static int  s_sub_size = 1;        /* 字幕字号 0小 1中 2大(默认中) */
+static int  s_dm_area = 0;         /* 弹幕覆盖范围 0全屏 1半屏 2四分之一 3八分之一 */
+
+/* ---------- 画面比例 ----------
+ *
+ * 上屏是 400x240(5:3)。片源按原始比例贴边居中时,16:9 的片上下各留
+ * 约 12px 黑边,竖屏片更是只占中间窄窄一条。这里允许**强制**一个比例:
+ * 画面被拉伸/压缩到该比例的框里,框再按「贴宽,放不下就贴高」居中。
+ *
+ * 【为什么是拉伸而不是裁切】裁切要改的是纹理坐标(subtex.left/right),
+ * 而 3D 模式下那两个值已经被左右分屏占用了,两套逻辑叠在一起很容易
+ * 画出半张脸。拉伸只改绘制时的缩放系数,和 3D、和硬解/软解都正交,
+ * 中途切换也不用重开纹理 —— 这是唯一一个「随时能改、改完立刻生效」
+ * 的实现方式。想要原始比例就选「自动」。 */
+static const struct { const char *name; int w, h; } ASPECTS[] = {
+	{ "自动", 0,  0  },   /* 片源原始比例(默认) */
+	{ "16:9", 16, 9  },
+	{ "9:16", 9,  16 },
+	{ "4:3",  4,  3  },
+	{ "1:1",  1,  1  },
+	{ "3:2",  3,  2  },
+	{ "4:5",  4,  5  },
+};
+#define ASPECT_N ((int)(sizeof(ASPECTS) / sizeof(ASPECTS[0])))
+static int s_pref_aspect = 0;
+
+/* 按当前比例设置算出画面在上屏里的目标矩形(ow x oh,居中绘制)。
+ * 【必须能重复调用】设置页里改一档就现调一次,靠的就是它无副作用。 */
+static void calc_output_size(Player *p) {
+	int aw, ah;
+	if (s_pref_aspect > 0 && s_pref_aspect < ASPECT_N) {
+		aw = ASPECTS[s_pref_aspect].w;
+		ah = ASPECTS[s_pref_aspect].h;
+	} else {                       /* 自动:片源原始比例 */
+		aw = p->vw > 0 ? p->vw : 16;
+		ah = p->vh > 0 ? p->vh : 9;
+	}
+	int ow = SCREEN_W;
+	int oh = (int)((long)ah * SCREEN_W / aw);
+	if (oh > SCREEN_H) {           /* 贴宽放不下 → 改成贴高 */
+		oh = SCREEN_H;
+		ow = (int)((long)aw * SCREEN_H / ah);
+	}
+	if (ow > SCREEN_W) ow = SCREEN_W;
+	if (oh > SCREEN_H) oh = SCREEN_H;
+	if (ow < 2) ow = 2;
+	if (oh < 2) oh = 2;
+	p->ow = ow & ~1;               /* 取偶:居中偏移才落在整像素上 */
+	p->oh = oh & ~1;
+}
 
 void player_set_meta(int64_t aid, int64_t cid, const char *bvid) {
 	s_meta_aid = aid;
@@ -249,6 +298,13 @@ void player_prefs_init(void) {
 	if (v >= 0 && v <= 2) s_dm_size = v;
 	v = settings_get("sub_size", s_sub_size);
 	if (v >= 0 && v <= 2) s_sub_size = v;
+	v = settings_get("dm_area", s_dm_area);
+	if (v >= 0 && v <= 3) s_dm_area = v;
+	/* 画面比例**要存**(和 3D 相反)。3D 是逐片决定的(2D 片开着只会花屏),
+	 * 比例是「我这台机器上想怎么看」——用户把 16:9 强制上之后,
+	 * 下一个视频还得再点一次的话,这个设置就等于没有。 */
+	v = settings_get("aspect", s_pref_aspect);
+	if (v >= 0 && v < ASPECT_N) s_pref_aspect = v;
 }
 
 void player_set_prefs(bool danmaku_on, bool force_sw, int qn) {
@@ -1992,14 +2048,10 @@ static int player_play_inner(const char *url, const char *title) {
 	AVCodecParameters *vpar = p->fmt->streams[p->vstream]->codecpar;
 	p->vw = vpar->width;
 	p->vh = vpar->height;
-	p->ow = SCREEN_W;
-	p->oh = p->vh * SCREEN_W / (p->vw ? p->vw : 1);
-	if (p->oh > SCREEN_H) {
-		p->oh = SCREEN_H;
-		p->ow = p->vw * SCREEN_H / p->vh;
-	}
-	p->ow &= ~1; p->oh &= ~1;
-	printf("video %dx%d -> %dx%d\n", p->vw, p->vh, p->ow, p->oh);
+	calc_output_size(p);
+	/* 调试台只吃 ASCII(中文会被滤成 ?),所以打档位号不打 name */
+	printf("video %dx%d -> %dx%d (aspect pref=%d)\n",
+	       p->vw, p->vh, p->ow, p->oh, s_pref_aspect);
 	if (p->fmt->duration > 0)
 		p->duration = (double)p->fmt->duration / AV_TIME_BASE;
 	p->fps = av_q2d(p->fmt->streams[p->vstream]->avg_frame_rate);
@@ -2119,6 +2171,7 @@ static int player_play_inner(const char *url, const char *title) {
 
 	dm_reset();
 	dm_set_size(s_dm_size);     /* 让模块与设置页显示一致 */
+	dm_set_area(s_dm_area);
 	sub_set_size(s_sub_size);
 	s_pref_3d = 0;          /* 每个视频默认 2D,要 3D 手动开 */
 	ui_set_3d(false);
@@ -2449,16 +2502,22 @@ static int player_play_inner(const char *url, const char *title) {
 				                 tp.px, tp.py))
 					in_comments = false;
 			} else if (in_psettings && !ui_console_active()) { /* 播放设置子页 */
+				/* 四行两列。行距 42(按钮 38 + 缝 4):比原来的三行 40+8
+				 * 少占 6px,正好腾出第四行,底下还留得住两行说明。
+				 * 【别再往里加按钮了】再加就得上翻页,而翻页在一个
+				 * 「看片时顺手点一下」的面板上是纯负担。 */
+				#define PS_Y(row) (26.0f + (row) * 42.0f)
+				#define PS_H 38.0f
 				ui_begin_bottom();
 				ui_text(10, 4, UI_SHARP, UI_COL_TEXT, "播放设置");
-				if (ui_button(10, 28, 145, 40,
+				if (ui_button(10, PS_Y(0), 145, PS_H,
 				              s_pref_3d ? "3D:开" : "3D:关",
 				              s_pref_3d ? UI_COL_ACCENT : UI_COL_SEL,
 				              btn_touch, tp.px, tp.py)) {
 					s_pref_3d = !s_pref_3d;
 					ui_set_3d(s_pref_3d != 0);
 				}
-				if (ui_button(165, 28, 145, 40,
+				if (ui_button(165, PS_Y(0), 145, PS_H,
 				              s_pref_sub ? "字幕:开" : "字幕:关",
 				              s_pref_sub ? UI_COL_ACCENT : UI_COL_SEL,
 				              btn_touch, tp.px, tp.py)) {
@@ -2485,34 +2544,64 @@ static int player_play_inner(const char *url, const char *title) {
 					static const char *sz[3] = { "弹幕字号:小",
 					                             "弹幕字号:中",
 					                             "弹幕字号:大" };
-					if (ui_button(10, 76, 145, 40, sz[s_dm_size],
+					if (ui_button(10, PS_Y(1), 145, PS_H, sz[s_dm_size],
 					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 						s_dm_size = (s_dm_size + 1) % 3;
 						settings_set("dm_size", s_dm_size);
 						dm_set_size(s_dm_size);
+						dm_set_area(s_dm_area);   /* 行数依赖字号,重算一次 */
 					}
 				}
 				{	/* 字幕字号(占原"返回"的位置) */
 					static const char *ssz[3] = { "字幕字号:小",
 					                              "字幕字号:中",
 					                              "字幕字号:大" };
-					if (ui_button(165, 76, 145, 40, ssz[s_sub_size],
+					if (ui_button(165, PS_Y(1), 145, PS_H, ssz[s_sub_size],
 					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 						s_sub_size = (s_sub_size + 1) % 3;
 						settings_set("sub_size", s_sub_size);
 						sub_set_size(s_sub_size);
 					}
 				}
-				if (ui_button(10, 124, 145, 40, "调试台", UI_COL_SEL,
+				{	/* 画面比例:循环切换,当场生效(只改绘制时的缩放) */
+					char ab[32];
+					snprintf(ab, sizeof(ab), "画面比例:%s",
+					         ASPECTS[s_pref_aspect].name);
+					if (ui_button(10, PS_Y(2), 145, PS_H, ab,
+					              s_pref_aspect ? UI_COL_ACCENT : UI_COL_SEL,
+					              btn_touch, tp.px, tp.py)) {
+						s_pref_aspect = (s_pref_aspect + 1) % ASPECT_N;
+						settings_set("aspect", s_pref_aspect);
+						calc_output_size(p);
+					}
+				}
+				{	/* 弹幕范围:从上屏顶部往下占多少 */
+					static const char *ar[4] = { "弹幕范围:全屏",
+					                             "弹幕范围:1/2",
+					                             "弹幕范围:1/4",
+					                             "弹幕范围:1/8" };
+					if (ui_button(165, PS_Y(2), 145, PS_H, ar[s_dm_area],
+					              s_dm_area ? UI_COL_ACCENT : UI_COL_SEL,
+					              btn_touch, tp.px, tp.py)) {
+						s_dm_area = (s_dm_area + 1) % 4;
+						settings_set("dm_area", s_dm_area);
+						dm_set_area(s_dm_area);
+						/* 行数是范围 x 字号一起决定的,光看档位看不出
+						 * 实际剩几行 —— 打出来,免得又靠数屏幕 */
+						printf("danmaku area=%d -> %d rows\n",
+						       s_dm_area, dm_rows());
+					}
+				}
+				if (ui_button(10, PS_Y(3), 145, PS_H, "调试台", UI_COL_SEL,
 				              btn_touch, tp.px, tp.py))
 					want_console = true;
 				/* 右下角:软解才有的同步/流畅;硬解时该位置放"返回" */
 				if (!p->use_mvd) {
-					if (ui_button(165, 124, 145, 40,
+					if (ui_button(165, PS_Y(3), 145, PS_H,
 					              p->sync_mode ? "软解:同步优先" : "软解:流畅优先",
 					              UI_COL_SEL, btn_touch, tp.px, tp.py))
 						p->sync_mode = !p->sync_mode;
-				} else if (ui_button(165, 124, 145, 40, "返回", UI_COL_SEL,
+				} else if (ui_button(165, PS_Y(3), 145, PS_H, "返回", UI_COL_SEL,
 				                     btn_touch, tp.px, tp.py)) {
 					in_psettings = false;
 				}
@@ -2528,12 +2617,16 @@ static int player_play_inner(const char *url, const char *title) {
 						snprintf(sb, sizeof(sb), "字幕:需登录后才能获取");
 					else
 						snprintf(sb, sizeof(sb), "字幕:本片无中文字幕轨");
-					ui_text(10, 176, UI_SHARP, UI_COL_DIM, sb);
+					ui_text(10, PS_Y(4) - 2, UI_SHARP, UI_COL_DIM, sb);
 				}
-				ui_text(10, 176 + 22, UI_SHARP, UI_COL_DIM,
-				        "3D 需左右分屏片源");
-				ui_text(10, 176 + 44, UI_SHARP, UI_COL_DIM,
-				        "调试台内双击触摸屏返回   B 键退出设置");
+				/* 只剩两行说明的位置了(第四行按钮吃掉一行),所以这行
+				 * 得把「3D 要什么片源」和「怎么退出」并成一句。
+				 * 弹幕范围/画面比例不写说明:按钮上就是当前值,点一下
+				 * 上屏当场变,比一行小字管用。 */
+				ui_text(10, PS_Y(4) + 18, UI_SHARP, UI_COL_DIM,
+				        "3D 需左右分屏片源   B 键退出设置");
+				#undef PS_Y
+				#undef PS_H
 			} else if (ui_console_active()) {  /* 日志页(自绘) */
 				if (ui_draw_log(touched, (kHeld & KEY_TOUCH) != 0,
 				                tp.px, tp.py))
