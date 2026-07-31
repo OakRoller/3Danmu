@@ -149,6 +149,10 @@ typedef struct {
 	 * 清理的判据必须是"我有没有拿到它",不能是"整件事成没成" ——
 	 * 两者不等价时就会漏释放,见 audio_exit 的说明 */
 	bool ndsp_ok;
+	/* 没声音时给用户看的原因。**必须区分**「这台机器缺 dspfirm」和
+	 * 「这个视频本来就没音轨」——前者要用户去导一次固件,后者什么都不用做。
+	 * 都显示成"无声音"的话,用户只会以为程序坏了。 */
+	char audio_err[56];
 	u64 start_ms, pause_t0;
 
 	double duration;
@@ -402,8 +406,13 @@ static int64_t avio_seek_cb(void *opaque, int64_t offset, int whence) {
 /* ---------- 音频(仅 worker 线程调用) ---------- */
 
 static bool audio_init(Player *p) {
-	if (R_FAILED(ndspInit()))
+	/* ndspInit 失败几乎总是同一个原因:SD 卡上没有 /3ds/dspfirm.cdc。
+	 * 那是主机的 DSP 固件,受版权保护、不能随程序分发,必须用户自己导出。
+	 * 这是新用户最常撞上的一件事,别让它只在调试台里说一声。 */
+	if (R_FAILED(ndspInit())) {
+		snprintf(p->audio_err, sizeof(p->audio_err), "无声音:缺 dspfirm.cdc(见 README)");
 		return false;
+	}
 	p->ndsp_ok = true;          /* 从这一刻起就欠一次 ndspExit */
 	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
 	ndspChnReset(0);
@@ -411,7 +420,10 @@ static bool audio_init(Player *p) {
 	ndspChnSetRate(0, (float)SAMPLE_RATE);
 	ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 	p->abuf = (s16 *)linearAlloc(AUDIO_NBUFS * AUDIO_SAMPLES_PER_BUF * 2 * sizeof(s16));
-	if (!p->abuf) { ndspExit(); p->ndsp_ok = false; return false; }
+	if (!p->abuf) {
+		snprintf(p->audio_err, sizeof(p->audio_err), "无声音:内存不足");
+		ndspExit(); p->ndsp_ok = false; return false;
+	}
 	memset(p->wbuf, 0, sizeof(p->wbuf));
 	for (int i = 0; i < AUDIO_NBUFS; i++) {
 		p->wbuf[i].data_vaddr = p->abuf + i * AUDIO_SAMPLES_PER_BUF * 2;
@@ -2025,13 +2037,21 @@ static int player_play_inner(const char *url, const char *title) {
 		printf("decoder: software h264 (dual-core) - %s\n", why);
 	}
 
-	if (p->astream >= 0) {
+	p->audio_err[0] = 0;
+	if (p->astream < 0) {
+		/* 片源本身没有音轨 —— 用户什么都不用做,别引导他去折腾固件 */
+		snprintf(p->audio_err, sizeof(p->audio_err), "此视频没有音轨");
+	} else {
 		AVCodecParameters *apar = p->fmt->streams[p->astream]->codecpar;
 		const AVCodec *ac = avcodec_find_decoder(apar->codec_id);
-		if (ac) {
+		if (!ac) {
+			snprintf(p->audio_err, sizeof(p->audio_err), "无声音:音频格式不支持");
+		} else {
 			p->adec = avcodec_alloc_context3(ac);
 			avcodec_parameters_to_context(p->adec, apar);
-			if (avcodec_open2(p->adec, ac, NULL) == 0 && audio_init(p)) {
+			if (avcodec_open2(p->adec, ac, NULL) != 0) {
+				snprintf(p->audio_err, sizeof(p->audio_err), "无声音:音频解码器打不开");
+			} else if (audio_init(p)) {   /* 失败时 audio_init 自己填了原因 */
 				AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
 				swr_alloc_set_opts2(&p->swr,
 					&out_layout, AV_SAMPLE_FMT_S16, SAMPLE_RATE,
@@ -2039,12 +2059,16 @@ static int player_play_inner(const char *url, const char *title) {
 					0, NULL);
 				if (p->swr && swr_init(p->swr) == 0)
 					p->audio_ok = true;
+				else
+					snprintf(p->audio_err, sizeof(p->audio_err), "无声音:重采样初始化失败");
 			}
 		}
 	}
-	ui_trace("audio %s", p->audio_ok ? "ok" : "UNAVAILABLE");
+	if (p->audio_ok) p->audio_err[0] = 0;
+	ui_trace("audio %s%s%s", p->audio_ok ? "ok" : "UNAVAILABLE",
+	         p->audio_err[0] ? " - " : "", p->audio_err);
 	if (!p->audio_ok)
-		printf("audio unavailable (missing dspfirm.cdc?), video only\n");
+		printf("audio unavailable: %s\n", p->audio_err[0] ? p->audio_err : "?");
 	/* 开播也要用首个音频帧的真实 pts 校准时钟:音频流首个 pts 未必是 0,
 	 * 不校准的话弹幕(绝对时间)会整体偏移几百毫秒 */
 	p->clock_resync = true;
@@ -2469,6 +2493,10 @@ static int player_play_inner(const char *url, const char *title) {
 				ui_text(10, 26, UI_SHARP, UI_COL_DIM, tbuf);
 				ui_text(140, 26, UI_SHARP, UI_COL_DIM,
 				        p->use_mvd ? "硬件解码" : "软件解码");
+				/* 没声音的标记跟解码方式放同一行:这行本来就是"当前这条片子
+				 * 是怎么在放的"。用醒目色 —— 静音是用户第一眼就想知道原因的事 */
+				if (!p->audio_ok)
+					ui_text(228, 26, UI_SHARP, UI_COL_ACCENT, "无声音");
 
 				/* ---- 可拖动进度条 ---- */
 				#define BAR_X 14.0f
@@ -2530,7 +2558,11 @@ static int player_play_inner(const char *url, const char *title) {
 				if (ui_button(214, 50, 96, 40, "设置", UI_COL_SEL,
 				              btn_touch, tp.px, tp.py))
 					in_psettings = true;
-				if (s_pref_3d != 0 && s_cur_qn == 16)
+				/* 这一行只放得下一条。没声音优先:3D 那条是"可以更好",
+				 * 静音是"东西没按预期工作",后者更需要解释 */
+				if (!p->audio_ok && p->audio_err[0])
+					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT, p->audio_err);
+				else if (s_pref_3d != 0 && s_cur_qn == 16)
 					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT,
 					        "3D 建议切 480P 更清晰");
 				if (ui_button(10, 100, 96, 40,
