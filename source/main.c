@@ -97,6 +97,10 @@ static void set_status(const char *ui_utf8, const char *log_ascii) {
 
 static void busy_frame(const char *msg);   /* 定义在下面 */
 
+/* 列表加载最多试几次(含第一次)。3 次、退避 0.8s+1.6s —— 再多就该让
+ * 用户自己决定了:接口真的挂了的话,机器替他干等只是把失败拖得更久。 */
+#define LIST_RETRY_MAX 3
+
 static void load_list(void) {
 	set_status("加载中...", "loading...");
 	/* 【翻页时别清屏】先画一帧:**列表原样留着**,只在下屏状态条上提示。
@@ -112,23 +116,48 @@ static void load_list(void) {
 	 * 放在画帧**之后**:这样那一帧里封面还在,不会先闪掉一排图。 */
 	thumb_stop();
 
-	int r;
-	switch (s_mode) {
-	case MODE_SEARCH:
-		r = bili_search(s_keyword, s_page, s_list, MAX_LIST, &s_count);
-		break;
-	case MODE_RECOMMEND:
-		r = bili_recommend(s_page, s_list, MAX_LIST, &s_count);
-		break;
-	case MODE_HISTORY:
-		r = bili_history(s_page, s_list, MAX_LIST, &s_count);
-		break;
-	case MODE_FAV:
-		r = bili_fav(s_page, s_list, MAX_LIST, &s_count);
-		break;
-	default:
-		r = bili_popular(s_page, s_list, MAX_LIST, &s_count);
-		break;
+	/* 【自动重试】列表接口偶发失败是常态:3DS 的 httpc 本就脆,
+	 * B 站对掌机 UA 也时不时风控性地拒一次。这种失败重来一次多半就好了,
+	 * 让用户自己按 A 只是把一件机器该做的事推给他。
+	 * 但重试必须**可中断**:等待期间照常画帧、B 键随时放弃,
+	 * 否则网络真断了就成了一个按不动的三秒卡顿。 */
+	int r = -1;
+	for (int attempt = 0; ; attempt++) {
+		switch (s_mode) {
+		case MODE_SEARCH:
+			r = bili_search(s_keyword, s_page, s_list, MAX_LIST, &s_count);
+			break;
+		case MODE_RECOMMEND:
+			r = bili_recommend(s_page, s_list, MAX_LIST, &s_count);
+			break;
+		case MODE_HISTORY:
+			r = bili_history(s_page, s_list, MAX_LIST, &s_count);
+			break;
+		case MODE_FAV:
+			r = bili_fav(s_page, s_list, MAX_LIST, &s_count);
+			break;
+		default:
+			r = bili_popular(s_page, s_list, MAX_LIST, &s_count);
+			break;
+		}
+		if (r == 0 || attempt >= LIST_RETRY_MAX - 1) break;
+		if (net_is_shutting_down() || aptShouldClose()) break;
+
+		/* 退避 0.8s / 1.6s:两次之间不留间隔的话,失败往往只是重复一遍 */
+		bool give_up = false;
+		char m[96];
+		snprintf(m, sizeof(m), "加载失败,重试中 %d/%d(B 放弃)",
+		         attempt + 2, LIST_RETRY_MAX);
+		u64 t0 = osGetTime();
+		u32 wait_ms = 800u * (u32)(attempt + 1);
+		while (osGetTime() - t0 < wait_ms) {
+			/* 这是我们自己的子循环,一帧扫一次输入 —— 和登录页同一套规矩 */
+			hidScanInput();
+			if (hidKeysDown() & KEY_B) { give_up = true; break; }
+			if (net_is_shutting_down() || aptShouldClose()) { give_up = true; break; }
+			busy_frame(m);
+		}
+		if (give_up) break;
 	}
 
 	s_sel = 0;

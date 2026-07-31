@@ -186,7 +186,7 @@ typedef struct {
 	 * 0=不切 1=切软解 2=切回硬解 */
 	volatile int dec_switch;
 	u64 sw_since;               /* 降级到软解的时刻(0=没降级过) */
-	int hw_retried;             /* 本次播放已经试过切回硬解(只试一次) */
+	int hw_retried;             /* 本次播放已经试过几次切回硬解 */
 	/* 硬解后台试运行:软解照常出画,同时把同一批包也喂给 MVD,
 	 * 确认它连续出帧了再把显示源切过去 —— 用户看不到任何切换过程。
 	 * MVD 是硬件模块、软解是纯 CPU 的 ffmpeg,两者互不影响,可以并存 */
@@ -204,6 +204,11 @@ static Player s_player;
  * MVD 卡住往往是这一条流/这一次的偶发状况,没理由让后面所有视频都陪着吃软解。
  * 但连续失败就别再试了:每次重试都要 mvdstdInit 一次,
  * 而反复初始化一个已经不正常的系统模块正是把它彻底搞崩的路径。 */
+/* 一次播放里最多试几次切回硬解。三次配合 10s/30s/60s 的间隔,
+ * 覆盖到两分钟 —— 一过性的诱因基本都在这个窗口里过去了;
+ * 还不行就是真坏了,继续戳只会增加把 mvd 模块彻底搞崩的风险。 */
+#define HW_RETRY_MAX 3
+
 static bool s_disable_mvd = false;
 static int  s_mvd_fail_streak = 0;   /* 连续几个视频硬解失败 */
 #define MVD_FAIL_GIVEUP 3            /* 连续这么多次就本次运行不再试硬解 */
@@ -1248,11 +1253,27 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 				}
 				p->mvd_need_hdr = false;
 			}
-			while (so + 4 < dn) {
+			/* 【残缺的 AU 绝不能送进 MVD】mvd 是**系统模块**,喂它半截数据
+			 * 不是我们崩,是整机崩,PC 还落在它自己的代码里。
+			 * 实测现场:拖到片尾触发重连风暴,解封装器吐出一个 41 字节的
+			 * 包(正常 22~30KB),送进去当场 svcBreak。
+			 *
+			 * 【判据是「有没有截断」,不是「结果小不小」】
+			 * 第一版写的是 off < 128 —— 那个 128 是从**一个样本**猜的
+			 * (只见过 41B 是坏的、22~30KB 是好的),中间毫无依据。
+			 * 而静态画面的 P 帧几十字节完全正常(讲话视频、录屏),
+			 * 于是正常帧被丢掉、MVD 丢了参考帧就不出画、看门狗一超时
+			 * 就切软解 —— 一道防线把好数据也挡了。
+			 * 现在直接看长度前缀对不对得上:avcC 里每个 NAL 前有 4 字节
+			 * 大端长度,数据完整时这些长度会**正好铺满整个包**。
+			 * 铺不满就是截断,和帧本身多大无关。 */
+			bool trunc = false;
+			while (so + 4 <= dn) {
 				u32 sz = ((u32)d[so] << 24) | ((u32)d[so + 1] << 16) |
 				         ((u32)d[so + 2] << 8) | d[so + 3];
 				so += 4;
-				if (!sz || so + sz > dn || off + 3 + sz > VIDEO_IN_BUF) break;
+				if (!sz || so + sz > dn) { trunc = true; break; }  /* 长度对不上 */
+				if (off + 3 + sz > VIDEO_IN_BUF) { trunc = true; break; }
 				p->mvd_in[off++] = 0;
 				p->mvd_in[off++] = 0;
 				p->mvd_in[off++] = 1;
@@ -1260,18 +1281,10 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 				off += sz;
 				so += sz;
 			}
-			/* 【残缺的 AU 绝不能送进 MVD】
-			 * mvd 是**系统模块**,喂它半截数据不是我们崩,是它崩 ——
-			 * 整机蓝屏,而且 PC 落在它自己的代码里,addr2line 都用不上。
-			 * 实测现场:拖到片尾触发重连风暴,解封装器吐出一个 41 字节的
-			 * 包(正常是 22~30KB),送进去当场 svcBreak。
-			 *
-			 * 判据是「装得下一帧吗」而不是「解析出错了吗」:上面那个
-			 * while 循环对残缺数据是**静默 break**的,出不出错它都不说话,
-			 * 所以只能从结果的大小上认。参数集本身约 32 字节,
-			 * 一个真正的视频帧再小也不会只有几十字节。 */
-			if (off < 128) {
-				printf("mvd: skip runt AU %luB (truncated stream?)\n",
+			if (so != dn) trunc = true;   /* 尾巴没消费完 = 结构不完整 */
+			if (trunc || off == 0) {
+				printf("mvd: skip malformed AU (%lu/%lu consumed, out %luB)\n",
+				       (unsigned long)so, (unsigned long)dn,
 				       (unsigned long)off);
 				/* 跳过之后解码器缺了这一段,下次必须重新带参数集,
 				 * 否则它会拿着对不上的参考帧继续解 */
@@ -1715,15 +1728,24 @@ static void worker_main(void *arg) {
 			p->buffering = 0;
 		}
 
-		/* 降级满 10 秒就在后台试着把硬解拉起来(只试一次)。
-		 * 这段冷静期是给 mvd 系统模块留的 —— 刚出过问题就立刻重新初始化,
-		 * 正是把它彻底搞崩的路径(见 mvd_reset 注释)。
-		 * 敢压到 10 秒是因为试运行本身**不影响画面**:软解一直在出画,
-		 * 万一 MVD 还是坏的,坏的也只是后台那份。 */
-		if (!p->use_mvd && !p->hw_trial && p->sw_since && !p->hw_retried &&
+		/* 降级之后在后台试着把硬解拉起来。冷静期是给 mvd 系统模块留的
+		 * —— 刚出过问题就立刻重新初始化,正是把它彻底搞崩的路径
+		 * (见 mvd_reset 注释)。敢从 10 秒起步是因为试运行本身
+		 * **不影响画面**:软解一直在出画,万一 MVD 还是坏的,
+		 * 坏的也只是后台那份。
+		 *
+		 * 【为什么不是只试一次】原来只试一次,失败就整片软解到底。
+		 * 但降级的诱因常常是**一过性的**(一次网络抖动喂进半截数据、
+		 * 一次 seek 撞上重连),十秒后那阵子的状况早就过去了,
+		 * 而这一次失败可能只是赶巧。现在按 10s / 30s / 60s 递增重试三次:
+		 * 间隔拉开是为了不去反复戳一个真的坏掉的模块。 */
+		u32 hw_cool = (p->hw_retried == 0) ? 10000u
+		            : (p->hw_retried == 1) ? 30000u : 60000u;
+		if (!p->use_mvd && !p->hw_trial && p->sw_since &&
+		    p->hw_retried < HW_RETRY_MAX &&
 		    !s_pref_force_sw && !p->seek_req &&
-		    osGetTime() - p->sw_since > 10000) {
-			p->hw_retried = 1;
+		    osGetTime() - p->sw_since > hw_cool) {
+			p->hw_retried++;
 			if (mvd_start(p, p->fmt->streams[p->vstream]->codecpar)) {
 				p->hw_trial = 1;
 				p->hw_trial_frames = 0;
@@ -1731,7 +1753,11 @@ static void worker_main(void *arg) {
 				p->mvd_trial_noblit = 1;
 				printf("hw trial started (background)\n");
 			} else {
-				printf("hw trial: mvdstdInit failed, staying sw\n");
+				printf("hw trial %d/%d: mvdstdInit failed, staying sw\n",
+				       p->hw_retried, HW_RETRY_MAX);
+				/* 冷静期重新计时:下一次要在**这次失败之后**再等,
+				 * 不是接着上一次降级的时刻算 —— 否则后两次会连着放炮 */
+				p->sw_since = osGetTime();
 			}
 		}
 
@@ -1833,11 +1859,13 @@ static void worker_main(void *arg) {
 					continue;   /* 这个包已经喂过 MVD 了,下一轮正常走硬解 */
 				}
 				if (p->hw_trial_pkts >= 150) {
-					printf("hw trial failed (%d frames/%d pkts), staying sw\n",
+					printf("hw trial %d/%d failed (%d frames/%d pkts)\n",
+					       p->hw_retried, HW_RETRY_MAX,
 					       p->hw_trial_frames, p->hw_trial_pkts);
 					p->hw_trial = 0;
 					p->mvd_trial_noblit = 0;
 					mvd_stop(p);
+					p->sw_since = osGetTime();   /* 下一次冷静期从现在算 */
 				}
 			}
 			int dr = video_decode_pkt(p, vp, &tp, &au_count, &mvd_frames);
