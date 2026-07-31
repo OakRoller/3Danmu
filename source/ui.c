@@ -300,6 +300,18 @@ void ui_init(void) {
 		ui_trace("font: lineheight=%d k=%d/100 sharp=%d/100 (UI_SHARP=%d/100)",
 		         (int)(lh + 0.5f), (int)(s_font_k * 100.0f + 0.5f),
 		         (int)(100.0f / s_font_k + 0.5f), (int)(UI_SHARP * 100.0f + 0.5f));
+		/* 【点对点自检】UI_SHARP 必须被 eff_scale 吸附成精确 1.0,否则
+		 * 全工程的界面文字都在做非整数倍缩放 —— 那是「整屏发虚」而不是
+		 * 「这一处发虚」,肉眼很难归因,但这里一行就能判死。
+		 * 换字体/换 mkbcfnt 的 -s 之后先看这行:出现 NOT 1:1 就说明
+		 * UI_SHARP 掉出了吸附窗口,照上一行的 sharp=xx/100 改回去。 */
+		if (eff_scale(UI_SHARP) != 1.0f)
+			ui_trace("font: WARNING UI_SHARP NOT 1:1 (eff=%d/100) "
+			         "-> set UI_SHARP=%d/100",
+			         (int)(eff_scale(UI_SHARP) * 100.0f + 0.5f),
+			         (int)(100.0f / s_font_k + 0.5f));
+		else
+			ui_trace("font: UI_SHARP is 1:1 (point-to-point)");
 	}
 #endif
 }
@@ -368,6 +380,11 @@ float ui_slider_3d(void) {
 	return osGet3DSliderState();
 }
 
+/* 文字加重开关(见 ui.h 的说明)。默认开:界面文字全部受益;
+ * 弹幕那一路自己关掉,免得顶穿顶点预算 */
+static bool s_boost = true;
+void ui_text_boost(bool on) { s_boost = on; }
+
 /* 画一行字。
  *
  * 【必须检查 C2D_TextFontParse 的返回值】字形缓冲满时它返回 NULL,
@@ -389,8 +406,13 @@ void ui_text_z(float x, float y, float z, float scale, uint32_t color,
 	 * 设计的,前者不是。实测现象:换上像素字体后反而不如原来清楚,
 	 * 根源就是行高算出来是 17.33 这种小数,每行都偏了。
 	 * 在这里统一取整,调用方就不必个个操心。 */
-	C2D_DrawText(&t, C2D_WithColor,
-	             floorf(x + 0.5f), floorf(y + 0.5f), z, scale, scale, color);
+	float px = floorf(x + 0.5f), py = floorf(y + 0.5f);
+	C2D_DrawText(&t, C2D_WithColor, px, py, z, scale, scale, color);
+	/* 加重:同一份解析结果再画一遍(位置、字号完全一致 —— 挪半个像素
+	 * 就成了描边/重影,那是另一回事,只会更糊)。同 z 后画者胜,
+	 * 深度测试 GEQUAL 通过,等效于把 alpha 再混一次。 */
+	if (s_boost)
+		C2D_DrawText(&t, C2D_WithColor, px, py, z, scale, scale, color);
 }
 
 static void clip_cache_reset(void);   /* 定义在截断缓存那一段 */

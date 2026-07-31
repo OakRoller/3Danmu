@@ -390,8 +390,13 @@ static void draw_local(double clock, float xoff) {
 }
 
 void dm_draw(double clock, float xoff) {
+	/* 【这一路不加重】界面文字画两遍是为了补 12px 汉字的半格墨,
+	 * 但弹幕单帧上限 80 条、3D 还要双眼各来一遍 —— 加倍会顶穿 citro2d
+	 * 的顶点预算,而顶穿之后是**静默丢绘制**(画面残缺,且很难归因)。
+	 * 弹幕本来就在动、也不用逐字细读,少这一遍看不出来。 */
+	ui_text_boost(false);
 	draw_local(clock, xoff);
-	if (!s_items || s_count == 0) return;
+	if (!s_items || s_count == 0) { ui_text_boost(true); return; }
 
 	if (s_fresh) {
 		/* 数据刚发布:从头重扫、清空行占用。
@@ -444,4 +449,5 @@ void dm_draw(double clock, float xoff) {
 		ui_text(x + xoff, 2.0f + it->row * s_row_h, s_scale, it->color, it->text);
 		drawn++;
 	}
+	ui_text_boost(true);
 }
