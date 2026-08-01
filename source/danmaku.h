@@ -28,6 +28,12 @@ void dm_set_area(int level);
 /* 当前范围档位对应的可用行数(设置页显示用) */
 int  dm_rows(void);
 
+/* 弹幕速度:0..4 = 0.5x / 0.75x / 1.0x / 1.25x / 1.5x(默认 2 = 1.0x)。
+ * 档位取自 wiliwili 的 danmaku_style_speed,基准秒数按本机屏宽重定。
+ * 改的是「横穿一屏用几秒」,不改字号也不改行数。 */
+void dm_set_speed(int level);
+int  dm_speed(void);
+
 /* 自己刚发的弹幕:立即在本地显示(高亮色) */
 void dm_add_local(const char *text, double t);
 

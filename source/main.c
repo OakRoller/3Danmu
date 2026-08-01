@@ -49,7 +49,7 @@ unsigned int __stacksize__ = 256 * 1024;
 u32 __ctru_linear_heap_size = 25 * 1024 * 1024;
 
 typedef enum { MODE_POPULAR, MODE_RECOMMEND, MODE_SEARCH,
-               MODE_HISTORY, MODE_FAV } ListMode;
+               MODE_HISTORY, MODE_FAV, MODE_DYNAMIC } ListMode;
 
 static BiliVideo s_list[MAX_LIST];
 static int  s_count = 0;
@@ -135,6 +135,9 @@ static void load_list(void) {
 			break;
 		case MODE_FAV:
 			r = bili_fav(s_page, s_list, MAX_LIST, &s_count);
+			break;
+		case MODE_DYNAMIC:
+			r = bili_dynamic(s_page, s_list, MAX_LIST, &s_count);
 			break;
 		default:
 			r = bili_popular(s_page, s_list, MAX_LIST, &s_count);
@@ -223,7 +226,11 @@ static void draw_list(void) {
 			} else {
 				ui_rect_z(6, y + 2, 0.18f, THUMB_W, THUMB_H,
 				          C2D_Color32(0x30, 0x30, 0x3C, 0xFF));
-				ui_text(6 + 38, y + 24, 0.45f, UI_COL_DIM, "…");
+				/* 用 UI_SHARP 而不是随手写的 0.45:换成点阵字体后,
+				 * 落在吸附窗口外的字号一律是非整数倍缩放 —— 点阵字被
+				 * 非整数倍采样会**整笔画消失**,比轮廓字体糊得更难看。
+				 * 全工程只剩弹幕/字幕的小、大两档还在窗外(那是故意的)。 */
+				ui_text(6 + 38, y + 24, UI_SHARP, UI_COL_DIM, "…");
 			}
 			if (i == s_sel) {
 				/* 选中行:标题过长时缓慢跑马灯(停 1.2s → 滚动 →
@@ -290,6 +297,11 @@ static void draw_list(void) {
 	case MODE_FAV:
 		snprintf(title, sizeof(title), "默认收藏夹  P%d", s_page);
 		break;
+	case MODE_DYNAMIC:
+		/* 动态是游标翻页,不是页码 —— 写 P3 会让人以为能跳回 P1,
+		 * 而这个接口做不到。只写「第几批」 */
+		snprintf(title, sizeof(title), "动态·视频  第%d批", s_page);
+		break;
 	default:
 		snprintf(title, sizeof(title), "热门  P%d", s_page);
 		break;
@@ -301,14 +313,15 @@ static void draw_list(void) {
 }
 
 typedef struct {
-	bool login, settings, hist, fav, popular, recommend;
+	bool login, settings, hist, fav, popular, recommend, dynamic, posts;
 } ListActions;
 
 static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act) {
 	ui_begin_bottom();
-	ui_text(10, 4, UI_SHARP, UI_COL_TEXT, bili_logged_in() ? "已登录" : "未登录");
-	if (s_count == 0)
-		ui_text(108, 4, UI_SHARP, UI_COL_ACCENT, "加载失败?按 A 重试");
+	/* 页头和播放器那三页统一:深色条 + 粉色下边线。
+	 * 右上角放登录态 —— 「能不能看历史/收藏/动态」全看它,
+	 * 而它以前和「加载失败」挤在同一行,失败时反而被顶掉。 */
+	ui_panel_head("频道", bili_logged_in() ? bili_username() : "未登录");
 	{	/* 底部状态条:在做什么 + 总进度 */
 		int done = 0, total = 0;
 		bool busy = thumb_progress(&done, &total);
@@ -333,35 +346,54 @@ static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act)
 	 * 高亮 = s_hl_mode(点击后立刻切过去,连扫码登录期间也跟着走),
 	 * 未设置时跟随实际频道 s_mode */
 	int hl = (s_hl_mode >= 0) ? s_hl_mode : (int)s_mode;
-	if (ui_button(10, 32, 145, 40, "推荐",
+	/* 四行两列,行距 38(按钮 34 + 缝 4)。从原来的三行 48 收下来,
+	 * 腾出第四行给动态,末行底边 172 仍在 UI_TOUCH_BOTTOM 以内。 */
+	#define CH_Y(row) (30.0f + (row) * 38.0f)
+	#define CH_H 34.0f
+	if (ui_button(8, CH_Y(0), 149, CH_H, "推荐",
 	              hl == MODE_RECOMMEND ? UI_COL_ACCENT : UI_COL_SEL,
 	              touched, tx, ty)) {
 		act->recommend = true;
 		s_hl_mode = MODE_RECOMMEND;
 	}
-	if (ui_button(165, 32, 145, 40, "热门",
+	if (ui_button(163, CH_Y(0), 149, CH_H, "热门",
 	              hl == MODE_POPULAR ? UI_COL_ACCENT : UI_COL_SEL,
 	              touched, tx, ty)) {
 		act->popular = true;
 		s_hl_mode = MODE_POPULAR;
 	}
-	if (ui_button(10, 80, 145, 40, "历史",
+	if (ui_button(8, CH_Y(1), 149, CH_H, "历史",
 	              hl == MODE_HISTORY ? UI_COL_ACCENT : UI_COL_SEL,
 	              touched, tx, ty)) {
 		act->hist = true;
 		s_hl_mode = MODE_HISTORY;
 	}
-	if (ui_button(165, 80, 145, 40, "收藏",
+	if (ui_button(163, CH_Y(1), 149, CH_H, "收藏",
 	              hl == MODE_FAV ? UI_COL_ACCENT : UI_COL_SEL,
 	              touched, tx, ty)) {
 		act->fav = true;
 		s_hl_mode = MODE_FAV;
 	}
-	if (ui_button(10, 128, 145, 40, "设置", UI_COL_SEL, touched, tx, ty))
+	/* 动态拆成两个入口:视频动态能进主列表直接播,图文/文字进不了
+	 * 视频列表(没有 bvid、没有封面),只能单开一页读。合成一个按钮
+	 * 就必然要在里面再分一次页,不如在这里一次说清。 */
+	if (ui_button(8, CH_Y(2), 149, CH_H, "动态·视频",
+	              hl == MODE_DYNAMIC ? UI_COL_ACCENT : UI_COL_SEL,
+	              touched, tx, ty)) {
+		act->dynamic = true;
+		s_hl_mode = MODE_DYNAMIC;
+	}
+	if (ui_button(163, CH_Y(2), 149, CH_H, "动态·图文",
+	              UI_COL_SEL, touched, tx, ty))
+		act->posts = true;
+	if (ui_button(8, CH_Y(3), 149, CH_H, "设置", UI_COL_SEL, touched, tx, ty))
 		act->settings = true;
-	if (ui_button(165, 128, 145, 40, bili_logged_in() ? "注销" : "扫码登录",
+	if (ui_button(163, CH_Y(3), 149, CH_H,
+	              bili_logged_in() ? "注销" : "扫码登录",
 	              UI_COL_SEL, touched, tx, ty))
 		act->login = true;
+	#undef CH_Y
+	#undef CH_H
 }
 
 /* 设置页上屏:当前设置一览。
@@ -602,6 +634,200 @@ static void busy_frame(const char *msg) {
 	ui_end();
 }
 
+/* ---------- 动态·图文 ----------
+ *
+ * 文字/图文/转发/专栏这些动态进不了视频列表:没有 bvid、没有封面,
+ * 点开也没东西可播。所以单开一页,纯阅读。
+ *
+ * 【为什么折行要预先算好】折行的每一步都要量字宽,而量宽是一次完整的
+ * 字形解析。放进逐帧绘制里,一屏三四条 x 每条几行 x 每秒 60 帧,
+ * 立刻掉帧(评论区已经踩过一次)。这里在**加载完成时**折一次,
+ * 之后每帧只是把算好的行画出来。 */
+#define DYN_MAX    24
+#define DYN_LINES  3        /* 每条最多显示几行正文,超出截断 */
+#define DYN_LINEW  160
+static BiliDynPost s_posts[DYN_MAX];
+static int  s_nposts = 0;
+static char s_post_line[DYN_MAX][DYN_LINES][DYN_LINEW];
+static int  s_post_nl[DYN_MAX];
+
+/* 按像素宽折行。
+ * 【逐字累加而不是逐次量整串】量整串的话每加一个字就要重新解析前面所有字,
+ * 500 字的动态要十几万次字形查表。位图字体的字距是可加的,
+ * 逐字量一次再累加,结果一样而代价是线性的。 */
+static void dyn_wrap(const char *s, float maxw, int idx) {
+	int line = 0, len = 0;
+	float w = 0.0f;
+	char ch[8];
+	s_post_line[idx][0][0] = 0;
+	for (const unsigned char *p = (const unsigned char *)s; *p && line < DYN_LINES; ) {
+		int cl = 1;                       /* UTF-8 字节数 */
+		if (*p >= 0xF0) cl = 4;
+		else if (*p >= 0xE0) cl = 3;
+		else if (*p >= 0xC0) cl = 2;
+		if (*p == '\n') {                 /* 硬换行 */
+			p++;
+			s_post_line[idx][line][len] = 0;
+			line++; len = 0; w = 0.0f;
+			if (line < DYN_LINES) s_post_line[idx][line][0] = 0;
+			continue;
+		}
+		memcpy(ch, p, (size_t)cl);
+		ch[cl] = 0;
+		float cw = ui_text_width(ch, UI_SHARP);
+		if (w + cw > maxw || len + cl >= DYN_LINEW - 1) {
+			s_post_line[idx][line][len] = 0;
+			line++; len = 0; w = 0.0f;
+			if (line >= DYN_LINES) break;
+			s_post_line[idx][line][0] = 0;
+		}
+		memcpy(&s_post_line[idx][line][len], ch, (size_t)cl);
+		len += cl;
+		w += cw;
+		p += cl;
+		/* 还有剩余内容却已经是最后一行了:结尾补省略号,
+		 * 免得看起来像「这条动态就这么半句」 */
+		if (line == DYN_LINES - 1 && w > maxw - 24.0f && p[0]) {
+			if (len + 3 < DYN_LINEW) {
+				memcpy(&s_post_line[idx][line][len], "…", 3);
+				len += 3;
+			}
+			s_post_line[idx][line][len] = 0;
+			line++;
+			break;
+		}
+	}
+	if (line < DYN_LINES) s_post_line[idx][line][len] = 0;
+	s_post_nl[idx] = (line >= DYN_LINES) ? DYN_LINES : (len > 0 ? line + 1 : line);
+	if (s_post_nl[idx] < 1) s_post_nl[idx] = 1;
+}
+
+static int dyn_load(int page) {
+	int n = 0;
+	/* 【别让忙帧画回视频列表】busy_frame 默认画的是主列表页 ——
+	 * 在动态页里加载下一批时闪一屏视频列表,看着像已经退出去了。
+	 * 换 P 时是同一个道理,复用同一个开关。 */
+	bool save_min = s_busy_minimal;
+	s_busy_minimal = true;
+	busy_frame("加载动态...");
+	if (bili_dynamic_posts(page, s_posts, DYN_MAX, &n) != 0) n = 0;
+	s_busy_minimal = save_min;
+	s_nposts = n;
+	for (int i = 0; i < n; i++) {
+		/* 正文优先,没正文就拿稿件/专栏标题顶上 —— 视频动态的
+		 * desc.text 常常是空的,只显示正文的话整条就是一片空白 */
+		const char *body = s_posts[i].text[0] ? s_posts[i].text
+		                                      : s_posts[i].title;
+		dyn_wrap(body, 372.0f, i);
+	}
+	s_busy[0] = 0;
+	return n;
+}
+
+static void show_dyn_posts(void) {
+	int page = 1;
+	float scroll = 0.0f;
+	float lh = ui_text_height(UI_SHARP);
+	float card = lh * (DYN_LINES + 1) + 14.0f;
+	if (dyn_load(page) < 0) return;
+
+	while (aptMainLoop()) {
+		/* 一帧只 scan 一次:扫两次会吃掉触摸按下沿(下屏点不动),
+		 * 和登录页/选集页同一个坑 */
+		hidScanInput();
+		u32 kd = hidKeysDown();
+		u32 kh = hidKeysHeld();
+		touchPosition tp = { 0, 0 };
+		bool touched = (kd & KEY_TOUCH) != 0;
+		if (touched) hidTouchRead(&tp);
+		if (kd & KEY_B) return;
+		if (net_is_shutting_down() || aptShouldClose()) return;
+
+		circlePosition cp;
+		hidCircleRead(&cp);
+		if (cp.dy > 20 || (kh & KEY_UP))   scroll -= 4.0f;
+		if (cp.dy < -20 || (kh & KEY_DOWN)) scroll += 4.0f;
+		float maxscroll = s_nposts * card - 206.0f;
+		if (maxscroll < 0) maxscroll = 0;
+		if (scroll < 0) scroll = 0;
+		if (scroll > maxscroll) scroll = maxscroll;
+
+		bool want_prev = false, want_next = false;
+		if (kd & KEY_L) want_prev = true;
+		if (kd & KEY_R) want_next = true;
+
+		ui_begin();
+		for (int i = 0; i < s_nposts; i++) {
+			float y = (float)(int)(30.0f + i * card - scroll);
+			if (y > 240.0f) break;
+			if (y + card < 26.0f) continue;
+			/* 隔行底色:卡片之间没有分隔线时,连着几条短动态会糊成一片 */
+			if (i & 1) ui_rect_z(8, y - 4, 0.15f, 384, card - 2, UI_COL_SEL);
+			float kw = ui_text_width(s_posts[i].kind, UI_SHARP);
+			ui_rect_z(10, y, 0.16f, kw + 10.0f, lh + 2.0f,
+			          C2D_Color32(0x5A, 0x22, 0x33, 0xFF));
+			ui_text(15, y + 1, UI_SHARP, UI_COL_ACCENT, s_posts[i].kind);
+			ui_text_clipped(kw + 26.0f, y + 1, UI_SHARP, UI_COL_WHITE,
+			                s_posts[i].user, 240.0f);
+			{	/* 时间右对齐:长短不一,左对齐会跟着用户名长度跳 */
+				float tw2 = ui_text_width(s_posts[i].time, UI_SHARP);
+				ui_text(390.0f - tw2, y + 1, UI_SHARP, UI_COL_DIM,
+				        s_posts[i].time);
+			}
+			for (int k = 0; k < s_post_nl[i]; k++)
+				ui_text_clipped(14, y + lh + 4.0f + k * lh, UI_SHARP,
+				                UI_COL_TEXT, s_post_line[i][k], 372.0f);
+		}
+		if (s_nposts == 0)
+			ui_text(120, 110, UI_SHARP, UI_COL_DIM, "这一批没有内容");
+		/* 顶栏最后画并抬 z:卡片文字 z=0.5 会穿透先画的栏底 */
+		ui_rect_z(0, 0, 0.6f, 400, 26, UI_COL_ACCENT);
+		{
+			char t[64];
+			snprintf(t, sizeof(t), "动态·图文  第%d批  共%d条", page, s_nposts);
+			ui_text_clipped_z(6, 3, 0.7f, UI_SHARP, UI_COL_WHITE, t, 388);
+		}
+
+		if (!ui_console_active()) {
+			ui_begin_bottom();
+			ui_panel_head("动态·图文", "B 返回");
+			ui_text(10, 36, UI_SHARP, UI_COL_DIM,
+			        "上下/摇杆滚动   L/R 翻批");
+			if (ui_button(8, 70, 149, 40, "上一批", UI_COL_SEL,
+			              touched, tp.px, tp.py))
+				want_prev = true;
+			if (ui_button(163, 70, 149, 40, "下一批", UI_COL_SEL,
+			              touched, tp.px, tp.py))
+				want_next = true;
+			if (ui_button(8, 118, 304, 40, "返回", UI_COL_SEL,
+			              touched, tp.px, tp.py)) {
+				ui_end();
+				return;
+			}
+			if (s_busy[0])
+				ui_text_clipped(10, 176, UI_SHARP, UI_COL_ACCENT, s_busy, 300);
+		} else {
+			/* 调试台开着也得把下屏画掉,否则两个后台缓冲各留一份旧内容
+			 * → 闪烁(选集页那里踩过) */
+			touchPosition t2;
+			hidTouchRead(&t2);
+			if (ui_draw_log(touched, (kh & KEY_TOUCH) != 0, t2.px, t2.py))
+				ui_bottom_debug(false);
+		}
+		ui_end();
+
+		/* 翻批放在 ui_end 之后:dyn_load 里要画自己的忙帧,
+		 * 夹在 begin/end 中间就是嵌套一帧 */
+		if (want_next) { page++; scroll = 0.0f; dyn_load(page); }
+		else if (want_prev && page > 1) { page--; scroll = 0.0f; dyn_load(page); }
+		else if (want_prev) {
+			/* 已经在第一批:游标接口回不去,重新拉一次就是最新的 */
+			scroll = 0.0f;
+			dyn_load(1);
+		}
+	}
+}
+
 /* 播放器发弹幕时的登录回调:未登录则拉起扫码流程 */
 static bool login_cb(void) {
 	if (!bili_logged_in())
@@ -750,9 +976,12 @@ static void play_selected(void) {
 				         s_pages[cur].page, v->title);
 			player_set_pages(s_pg_labelp, s_pg_dur, s_npages, cur);
 			play_stream(v, s_pages[cur].cid, t);
-			/* 【只有在选集里挑了才继续】按 B 退出播放器是「我看完了」,
-			 * 不是「我要挑下一集」—— 以前播完无条件弹选集页,
-			 * 想走的人得按两次 B。 */
+			/* 【下一 P 从哪来】两种情况会给出下标,这里不区分:
+			 *   1. 用户在选集里点了某一 P
+			 *   2. 这一 P 放到片尾了 —— 播放器自动给出 cur+1
+			 * 其余情况(按 B 走人、取流失败、最后一 P 放完)都是 -1,
+			 * 于是退回列表。注意**按 B 不算放完**:想中途走人的人
+			 * 按一次 B 就该出来,不能被自动续播粘住。 */
 			int pick = player_take_page_pick();
 			if (pick < 0) break;
 			/* 系统要关我们:别再开下一段流了 */
@@ -1035,8 +1264,17 @@ int main(void) {
 			s_hl_mode = -1;
 			if (s_mode != MODE_RECOMMEND) { s_mode = MODE_RECOMMEND; s_page = 1; load_list(); }
 		}
-		if (act.hist || act.fav) {
-			ListMode want = act.hist ? MODE_HISTORY : MODE_FAV;
+		if (act.posts) {
+			/* 图文动态和频道无关(它不进主列表),所以不动 s_mode ——
+			 * 看完 B 回来还在原来的频道上。 */
+			if (!bili_logged_in()) do_login();
+			s_pending_mode = -1;
+			if (bili_logged_in()) show_dyn_posts();
+			s_hl_mode = -1;
+		}
+		if (act.hist || act.fav || act.dynamic) {
+			ListMode want = act.hist ? MODE_HISTORY
+			              : act.fav  ? MODE_FAV : MODE_DYNAMIC;
 			if (!bili_logged_in())
 				do_login();          /* 未登录:直接拉起扫码 */
 			if (s_pending_mode >= 0) {           /* 登录界面里改去别的频道 */

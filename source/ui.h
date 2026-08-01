@@ -8,7 +8,10 @@
 
 #define UI_COL_BG     C2D_Color32(0x18, 0x18, 0x20, 0xFF)
 #define UI_COL_TEXT   C2D_Color32(0xEE, 0xEE, 0xEE, 0xFF)
-#define UI_COL_DIM    C2D_Color32(0x99, 0x99, 0xA5, 0xFF)
+/* 次要文字。【别再往暗调】0x99 那一版在实机上被反馈「整个界面发淡」——
+ * 这个字体的笔画本来就只有半格墨,再配一个中灰前景,等于淡上加淡。
+ * 提到 0xB6 之后仍然明显弱于正文(0xEE),但不至于要凑近了看。 */
+#define UI_COL_DIM    C2D_Color32(0xB6, 0xB6, 0xC2, 0xFF)
 #define UI_COL_ACCENT C2D_Color32(0xFB, 0x72, 0x99, 0xFF) /* B站粉 */
 #define UI_COL_SEL    C2D_Color32(0x2A, 0x2A, 0x3A, 0xFF)
 #define UI_COL_WHITE  C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF)
@@ -56,7 +59,7 @@ void ui_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
  * 新加可点元素时压在这以内比较保险;纯显示的东西放多低都无所谓。 */
 #define UI_TOUCH_BOTTOM 212.0f
 
-/* 文字加重(默认开)。同一串画两遍,叠出 a' = 1-(1-a)^2。
+/* 文字加重(默认开)。同一串共画三遍,叠出 a' = 1-(1-a)^3。
  *
  * 【为什么需要】图集里汉字只有 12x12 像素,笔画宽度不足一个像素 ——
  * 光栅化只能把它摊成两个约 50% 覆盖的像素(拿 tools/fontdump.py 挖出
@@ -93,6 +96,16 @@ void ui_begin_bottom(void);
 bool ui_button(float x, float y, float w, float h, const char *label,
                uint32_t bg, bool touched, float tx, float ty);
 
+/* 设置项按钮:左灰标签 + 右当前值(而不是把 "标签:值" 挤在一起居中)。
+ * hot = 这是个真·开关且开着 —— 左侧给一条粉色竖条 + 值用高亮色。
+ * 多值选项(字号/速度/比例…)一律传 false:按钮上已经写着当前值了。 */
+bool ui_opt(float x, float y, float w, float h, const char *label,
+            const char *value, bool hot, bool touched, float tx, float ty);
+
+/* 下屏统一页头:深色条 + 2px 粉色下边线,左标题右状态。
+ * 必须在 ui_begin_bottom 之后调用。 */
+void ui_panel_head(const char *title, const char *right);
+
 void ui_begin(void);  /* 一帧开始(清屏,场景=上屏左眼) */
 void ui_begin_top_right(void);  /* 切到上屏右眼(裸眼 3D 用) */
 void ui_set_3d(bool on);        /* 上屏立体模式开关 */
@@ -120,6 +133,9 @@ float ui_text_height(float scale);
  * 只影响整体大小,页面内的字号比例不变。 */
 void  ui_font_scale_set(float k);
 float ui_font_scale(void);
+/* 精确 n 倍原生字号(n=1 即 UI_SHARP 那一档)。点阵字体只有整数倍才清晰,
+ * 想要「更大且不糊」只能用它,别再手写 0.78 这种数。 */
+float ui_scale_x(int n);
 /* 当前倍率对应的 UI_FONT_TARGET 值(设置页显示,定稿后抄回 ui.c) */
 float ui_font_target(void);
 /* 字号代次:变一次加一。凡是缓存了「按当前字号量出来的像素宽度」的模块

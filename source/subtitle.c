@@ -32,6 +32,7 @@ static SubReq s_req;
 static int s_cursor = 0;
 static double s_last_clock = 0;
 static float s_scale = 0.52f;  /* 字号(sub_set_size)。0.52 = 清晰档 */
+static float s_lh    = 23.0f;  /* 行高,随字号在 sub_set_size 里算好 */
 /* 代际:每次 sub_load_async +1。旧线程若 join 超时仍在跑,回来时代际
  * 已经变了,它的结果必须丢弃——否则会把上一个视频的字幕"复活"到
  * 当前视频上(实测现象:开字幕出现的是刚才看的那个视频的字幕) */
@@ -41,9 +42,18 @@ static double s_duration = 0;    /* 视频时长(秒),0=未知 */
 void sub_set_duration(double seconds) { s_duration = seconds; }
 
 void sub_set_size(int level) {
-	/* 档位设计同弹幕(见 danmaku.c dm_set_size 的说明):中档 0.52 走清晰
-	 * 吸附,小/大取在窗口外保住尺寸差异 */
-	float sc = (level <= 0) ? 0.39f : (level >= 2) ? 0.78f : 0.52f;
+	/* 档位设计同弹幕(见 danmaku.c dm_set_size 的说明):
+	 * 中 = 原生 1:1(吸附点),小/大取在窗口外保住尺寸差异。
+	 * 轮廓字体下 1.5 倍(0.78)只是柔和一点;换成点阵字体的话
+	 * 必须改成精确整数倍,否则会整根掉笔画。 */
+	float sc = (level <= 0) ? 0.39f
+	         : (level >= 2) ? 0.78f
+	         : UI_SHARP;
+	/* 行高向字体要一次并存下来:sub_draw 是逐帧调的,
+	 * 在那里每帧问一次就是每帧一次字形解析。
+	 * 【放在早退之前】开机时 s_scale 的静态初值正好等于中档,
+	 * 放在后面的话这一句永远不会执行,行高就一直是静态初值。 */
+	s_lh = ui_text_height(sc) + 6.0f;
 	if (sc == s_scale) return;
 	s_scale = sc;
 	for (int i = 0; i < s_n; i++) {                      /* 宽度/折行缓存作废 */
@@ -202,7 +212,7 @@ void sub_draw(double clock) {
 	if (L->w < 0) L->w = ui_text_width(L->text, s_scale);
 
 	const float MAXW = 384.0f;
-	float lh = 23.0f * (s_scale / 0.52f);    /* 行高随字号(按吸附后的实际字高) */
+	float lh = s_lh;                         /* 行高:sub_set_size 里按实际字高算好 */
 	char l1[SUB_TEXTLEN], l2[SUB_TEXTLEN];
 	l1[0] = l2[0] = 0;
 
