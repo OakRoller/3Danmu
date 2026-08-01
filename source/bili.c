@@ -596,6 +596,147 @@ int bili_history(int page, BiliVideo *out, int max, int *count) {
 	return (n >= 0) ? 0 : -1;
 }
 
+/* ---------- 动态(关注的 UP 更新了什么) ----------
+ *
+ * x/polymer/web-dynamic/v1/feed/all —— 和网页版动态页同一个接口,只认
+ * cookie(SESSDATA),不需要 WBI 签名。type=video 只出投稿视频,
+ * type=all 连图文/文字/转发/专栏一起出。
+ *
+ * 【翻页不是页码,是游标】这个接口给的是一个不透明的 offset 字符串,
+ * 下一页必须把上一页返回的 offset 原样带回去。可主程序的列表模型是
+ * 「第几页」——所以游标存在这里:page<=1 就从头开始,page>1 用存着的那个。
+ * 两种 type 各存各的,互不干扰(用户在两个页面之间来回切也不会串页)。 */
+static char s_dyn_off_v[64] = "";     /* type=video 的游标 */
+static char s_dyn_off_a[64] = "";     /* type=all 的游标 */
+
+static Json *dyn_fetch(const char *type, int page, char **body) {
+	char *off = (strcmp(type, "video") == 0) ? s_dyn_off_v : s_dyn_off_a;
+	if (page <= 1) off[0] = 0;
+	char url[320];
+	/* timezone_offset 按东八区给:接口拿它算「几分钟前」这类相对时间,
+	 * 不给的话服务端按 UTC 算,pub_time 会差 8 小时 */
+	snprintf(url, sizeof(url),
+	         "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
+	         "?timezone_offset=-480&platform=web&type=%s&page=%d%s%s",
+	         type, page < 1 ? 1 : page,
+	         off[0] ? "&offset=" : "", off[0] ? off : "");
+	/* 动态接口对 referer 敏感:不带的话偶发 -352(风控) */
+	Json *j = api_get_ref(url, "https://t.bilibili.com/", body);
+	if (!j) return NULL;
+	/* 存下一页的游标。has_more=false 时 offset 可能是空串,存进去正好
+	 * 让下一次从头开始,不会卡在最后一页反复拿同一批 */
+	char nxt[64] = {0};
+	json_get_str(j, -1, "data.offset", nxt, sizeof(nxt));
+	snprintf(off, 64, "%s", nxt);
+	return j;
+}
+
+/* 视频动态 → 直接进主列表,和别的频道一样可以点开就播 */
+int bili_dynamic(int page, BiliVideo *out, int max, int *count) {
+	*count = 0;
+	if (!bili_logged_in()) {
+		snprintf(s_last_err, sizeof(s_last_err), "动态需登录");
+		return -1;
+	}
+	char *body = NULL;
+	Json *j = dyn_fetch("video", page, &body);
+	if (!j) return -1;
+	int arr = json_find(j, -1, "data.items");
+	int n = json_arr_len(j, arr);
+	for (int i = 0; i < n && *count < max; i++) {
+		int el = json_arr_at(j, arr, i);
+		char ty[40] = {0};
+		json_get_str(j, el, "type", ty, sizeof(ty));
+		/* type=video 理论上只回 AV,但直播预约/番剧也会混进来 —— 那些
+		 * 没有 archive.bvid,放进列表点了只会失败,不如不显示 */
+		if (strcmp(ty, "DYNAMIC_TYPE_AV") != 0) continue;
+		int av = json_find(j, el, "modules.module_dynamic.major.archive");
+		if (av < 0) continue;
+		BiliVideo *v = &out[*count];
+		memset(v, 0, sizeof(*v));
+		v->views = -1;
+		json_get_str(j, av, "bvid", v->bvid, sizeof(v->bvid));
+		json_get_int(j, av, "aid", &v->aid);
+		json_get_str(j, av, "cover", v->pic, sizeof(v->pic));
+		fix_pic_url(v->pic, sizeof(v->pic));
+		json_get_str(j, av, "title", v->title, sizeof(v->title));
+		strip_html(v->title);
+		/* 作者在 module_author 里,不在 archive 里 —— 动态的「谁发的」
+		 * 本来就比稿件的 owner 更准(转发/联合投稿都以这个为准) */
+		json_get_str(j, el, "modules.module_author.name",
+		             v->author, sizeof(v->author));
+		char dur[24] = {0};
+		if (json_get_str(j, av, "duration_text", dur, sizeof(dur)))
+			v->duration = parse_duration(dur);
+		/* 播放数是 "1.2万" 这种带单位的串,不是数字 —— 解析它不值当,
+		 * 留 -1 让列表那边显示成未知 */
+		if (v->bvid[0] && v->title[0]) (*count)++;
+	}
+	json_free(j);
+	free(body);
+	printf("dynamic: %d video(s) (page %d)\n", *count, page);
+	return (*count > 0) ? 0 : -1;
+}
+
+/* 全部动态 → 图文/文字那些没法进视频列表的,单开一页看 */
+int bili_dynamic_posts(int page, BiliDynPost *out, int max, int *count) {
+	*count = 0;
+	if (!bili_logged_in()) {
+		snprintf(s_last_err, sizeof(s_last_err), "动态需登录");
+		return -1;
+	}
+	char *body = NULL;
+	Json *j = dyn_fetch("all", page, &body);
+	if (!j) return -1;
+	int arr = json_find(j, -1, "data.items");
+	int n = json_arr_len(j, arr);
+	for (int i = 0; i < n && *count < max; i++) {
+		int el = json_arr_at(j, arr, i);
+		BiliDynPost *d = &out[*count];
+		memset(d, 0, sizeof(*d));
+		char ty[40] = {0};
+		json_get_str(j, el, "type", ty, sizeof(ty));
+		/* 类型名只取后缀:DYNAMIC_TYPE_AV → AV。接口以后加新类型时
+		 * 也不会在界面上变成空白,顶多显示个没见过的英文 */
+		const char *kind = "动态";
+		if      (!strcmp(ty, "DYNAMIC_TYPE_AV"))      kind = "视频";
+		else if (!strcmp(ty, "DYNAMIC_TYPE_WORD"))    kind = "文字";
+		else if (!strcmp(ty, "DYNAMIC_TYPE_DRAW"))    kind = "图文";
+		else if (!strcmp(ty, "DYNAMIC_TYPE_FORWARD")) kind = "转发";
+		else if (!strcmp(ty, "DYNAMIC_TYPE_ARTICLE")) kind = "专栏";
+		else if (!strcmp(ty, "DYNAMIC_TYPE_LIVE_RCMD")) kind = "直播";
+		else if (!strcmp(ty, "DYNAMIC_TYPE_PGC"))     kind = "番剧";
+		snprintf(d->kind, sizeof(d->kind), "%s", kind);
+		json_get_str(j, el, "modules.module_author.name",
+		             d->user, sizeof(d->user));
+		json_get_str(j, el, "modules.module_author.pub_time",
+		             d->time, sizeof(d->time));
+		json_get_str(j, el, "modules.module_dynamic.desc.text",
+		             d->text, sizeof(d->text));
+		/* 附带的稿件/专栏标题。视频动态的正文常常是空的,真正的内容
+		 * 在 archive.title 里 —— 只显示正文的话整条就是一片空白 */
+		int maj = json_find(j, el, "modules.module_dynamic.major");
+		if (maj >= 0) {
+			if (!json_get_str(j, maj, "archive.title",
+			                  d->title, sizeof(d->title)))
+				if (!json_get_str(j, maj, "article.title",
+				                  d->title, sizeof(d->title)))
+					json_get_str(j, maj, "live_rcmd.content",
+					             d->title, sizeof(d->title));
+			json_get_str(j, maj, "archive.bvid", d->bvid, sizeof(d->bvid));
+		}
+		strip_html(d->title);
+		strip_html(d->text);
+		/* 三样全空的条目(纯图片、投票、装扮…)没什么可显示的,跳过 */
+		if (!d->text[0] && !d->title[0] && !d->user[0]) continue;
+		(*count)++;
+	}
+	json_free(j);
+	free(body);
+	printf("dynamic posts: %d (page %d)\n", *count, page);
+	return (*count > 0) ? 0 : -1;
+}
+
 /* 收藏夹(默认收藏夹,需登录)。两步:查默认夹 id → 拉内容 */
 static int64_t s_fav_fid = 0;
 static bool s_sub_is_ai = false;

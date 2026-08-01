@@ -39,7 +39,23 @@ static C2D_Font s_font;          /* NULL = 系统默认字体 */
  * 子集上就整体放大(实测放大 33%,还因为拉伸而发虚)。
  * **每换一次字体(哪怕只是重新裁剪)都要用设置页的旋钮重新标定。**
  * 定稿方式:设置页「字号 -/+」调顺眼,把底下显示的 TARGET 抄回这里。 */
-#define UI_FONT_TARGET 33.3f   /* 新字体实机标定:0.52 档正好落在原生 1:1 */
+/* 【这个数必须跟着字体一起改,别照抄】它是「s_font_k x 行高」的乘积。
+ * 当前字体实测 lineFeed = 17,33.3/17 = 1.96,吸附点 1/k = 0.51,
+ * UI_SHARP(0.52) 正好落进去被收成精确 1.0。
+ * 换字体后先看 trace.log 开机第一行的 sharp=../100 对不对得上 52。
+ *
+ * 【换字体试过什么,别再走一遍弯路】为了治「发虚」试过两条路,都退回来了:
+ *   1. Fusion Pixel 12px 点阵字(-s 9)——图集满墨占比从 6.2% 干到 100%,
+ *      确实锐利,但 12px 设计的汉字字腔太挤,实机观感「太紧凑」。
+ *      而开源点阵字里**不存在 16px 以上还全覆盖的**
+ *      (Ark Pixel 16px 在 GBK 范围内实测只有 1232 个字形)。
+ *   2. 同一个 Noto 放大重转(-s 11/12/13)——实测**放大并不能变清晰**:
+ *      轮廓字的笔画宽度按比例缩放,AA 边缘同比变宽,满墨占比几乎不涨
+ *      (-s 13 只到 12.7%,再大反而崩到 1%),图集却涨到 17~28MB。
+ * 结论:这个字体的发虚是**图集本身没有实心笔画**,调字号救不回来;
+ * 真要治本只有换点阵字,而那要付出「紧凑」的代价。当前选择是维持原样,
+ * 靠 ui_text_boost 多叠几遍补对比度(见 ui.h)。 */
+#define UI_FONT_TARGET 33.3f   /* 当前字体实机标定:0.52 档正好落在原生 1:1 */
 /* 万一行高量不出来时的兜底倍率 */
 #define UI_FONT_K 0.85f
 static float s_font_k = 1.0f;   /* 实际生效值,ui_init 里按加载结果设定 */
@@ -226,7 +242,13 @@ void ui_init(void) {
 	 * 与 GUI 的 BGR8 双缓冲打架(退出后主页闪烁)。日志页改为自绘。 */
 
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
-	C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+	/* 【为什么要抬高对象上限】默认 4096。一帧最坏情况:3D 开着要画两遍
+	 * 上屏,每遍 80 条弹幕 x 十几个字 x 2(描边) 就接近 4000,再加字幕、
+	 * 覆盖层和下屏 GUI 必然顶穿 —— 而 citro2d 顶穿之后是**静默丢绘制**,
+	 * 表现为画面残缺,且极难归因(弹幕描边就是踩在这条线上加的)。
+	 * 每个对象约 108 字节,8192 比默认多吃约 440KB,
+	 * 而换字体已经省下 1MB 以上,买得起。 */
+	C2D_Init(8192);
 	C2D_Prepare();
 	s_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
 	s_top_r = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
@@ -408,11 +430,21 @@ void ui_text_z(float x, float y, float z, float scale, uint32_t color,
 	 * 在这里统一取整,调用方就不必个个操心。 */
 	float px = floorf(x + 0.5f), py = floorf(y + 0.5f);
 	C2D_DrawText(&t, C2D_WithColor, px, py, z, scale, scale, color);
-	/* 加重:同一份解析结果再画一遍(位置、字号完全一致 —— 挪半个像素
+	/* 加重:同一份解析结果再画两遍(位置、字号完全一致 —— 挪半个像素
 	 * 就成了描边/重影,那是另一回事,只会更糊)。同 z 后画者胜,
-	 * 深度测试 GEQUAL 通过,等效于把 alpha 再混一次。 */
-	if (s_boost)
+	 * 深度测试 GEQUAL 通过,等效于把 alpha 再混几次。
+	 *
+	 * 【为什么是两遍而不是一遍】叠 n 遍的结果是 a' = 1-(1-a)^n。
+	 * 这个字体的笔画像素实测九成以上是半格墨(a≈0.5):
+	 *   一遍 0.50 → 两遍 0.75 → 三遍 0.875
+	 * 原来只叠一遍,0.75 在深色底上看着就是「淡」。第三遍把最吃亏的
+	 * 那批中间调再往上抬一档,而**满墨像素(a=1)三遍还是 1**,
+	 * 所以不会把字撑肥,只是把该黑的地方补黑。
+	 * 代价是每串字多一遍顶点 —— 上面的 C2D_Init 已经把预算抬够了。 */
+	if (s_boost) {
 		C2D_DrawText(&t, C2D_WithColor, px, py, z, scale, scale, color);
+		C2D_DrawText(&t, C2D_WithColor, px, py, z, scale, scale, color);
+	}
 }
 
 static void clip_cache_reset(void);   /* 定义在截断缓存那一段 */
@@ -431,6 +463,21 @@ void ui_font_scale_set(float k) {
 }
 
 float ui_font_scale(void) { return s_font_k; }
+
+/* 精确 n 倍原生字号。
+ *
+ * 【点阵字体只有整数倍是清晰的】图集里每个笔画正好占满整数个纹素,
+ * 放大 1.5 倍时每个纹素摊到 1.5 个像素上 —— 一半的笔画被采样器
+ * **整根抹掉或糊成两条**,比轮廓字体在同倍率下难看得多
+ * (轮廓字体本来就是半透明边缘,重采样只是更糊一点)。
+ * 所以「想要更大」在这种字体上只有一个答案:取整数倍。
+ *
+ * n=1 时返回的就是吸附点本身(eff_scale 会把它收成精确 1.0);
+ * n>=2 落在吸附窗口外,eff_scale 走 s*k,正好还原成 n。 */
+float ui_scale_x(int n) {
+	if (n < 1) n = 1;
+	return (s_font_k > 0.01f) ? ((float)n / s_font_k) : (float)n;
+}
 
 /* 当前倍率换算成 UI_FONT_TARGET 该写多少 —— 设置页直接显示这个数,
  * 调顺眼之后照抄进 ui.c 即可,不用再从行高手算 */
@@ -718,6 +765,62 @@ bool ui_button(float x, float y, float w, float h, const char *label,
 	ui_text(x + (w - tw) / 2, y + (h - th) / 2, UI_SHARP,
 	        UI_COL_WHITE, label);
 	return hit;
+}
+
+/* 设置项:左灰标签 + 右当前值。
+ *
+ * 【为什么不继续用 "标签:值" 居中的普通按钮】
+ * 设置页是**竖着扫一列**看的:「我都设成了什么」。居中排版让每一行的
+ * 标签起点各不相同,值也各不相同,眼睛得逐行重新找位置。左右对齐之后
+ * 标签成一列、值成一列,扫一眼就读完了 —— 挤在 320px 上这点差别很明显。
+ *
+ * hot:真·开关(开着会改变行为)才给高亮。多值选项一律 false ——
+ * 按钮上写着当前值,再高亮只会让「非默认」看起来像「开启了什么」。 */
+bool ui_opt(float x, float y, float w, float h, const char *label,
+            const char *value, bool hot, bool touched, float tx, float ty) {
+	bool hit = touched && tx >= x && tx < x + w && ty >= y && ty < y + h;
+	ui_rect(x, y, w, h, UI_COL_SEL);
+	if (hit) {
+		ui_rect(x, y, w, 2, UI_COL_WHITE);
+		ui_rect(x, y + h - 2, w, 2, UI_COL_WHITE);
+		ui_rect(x, y, 2, h, UI_COL_WHITE);
+		ui_rect(x + w - 2, y, 2, h, UI_COL_WHITE);
+	}
+	/* 开着的开关:左边一条 3px 竖条。比整块变色克制,又一眼看得见 */
+	if (hot) ui_rect(x, y, 3, h, UI_COL_ACCENT);
+	ui_rect(x, y + h - 2, w, 2, C2D_Color32(0, 0, 0, 0x60));
+	float th = ui_text_height(UI_SHARP);
+	float ty0 = y + (h - th) / 2;
+	float vw = value ? ui_text_width(value, UI_SHARP) : 0.0f;
+	if (value && value[0])
+		ui_text(x + w - 7 - vw, ty0, UI_SHARP,
+		        hot ? UI_COL_ACCENT : UI_COL_WHITE, value);
+	/* 标签让给值:值是这一行真正要读的东西,挤不下时截标签而不是截值 */
+	if (label && label[0])
+		ui_text_clipped(x + 8, ty0, UI_SHARP, UI_COL_DIM, label,
+		                w - 16 - vw - 6);
+	return hit;
+}
+
+/* 下屏页头。三个子页面(主面板/设置/选集)以前各画各的:
+ * 有的顶一条粉色实心条,有的只有一行字 —— 切过去像换了个程序。
+ * 统一成「深色条 + 底下一条 2px 粉线」:比整条粉色克制,
+ * 又足够把页头和内容分开。右侧那格给状态(第几 P、登录名这类)。 */
+void ui_panel_head(const char *title, const char *right) {
+	const float H = 24.0f;
+	ui_rect(0, 0, 320, H, C2D_Color32(0x22, 0x22, 0x2C, 0xFF));
+	ui_rect(0, H - 2, 320, 2, UI_COL_ACCENT);
+	float th = ui_text_height(UI_SHARP);
+	float ty = (H - 2 - th) / 2.0f;
+	float rw = 0.0f;
+	if (right && right[0]) {
+		rw = ui_text_width(right, UI_SHARP);
+		if (rw > 150.0f) rw = 150.0f;
+		ui_text_clipped(312 - rw, ty, UI_SHARP, UI_COL_DIM, right, rw);
+		rw += 8.0f;
+	}
+	if (title && title[0])
+		ui_text_clipped(8, ty, UI_SHARP, UI_COL_WHITE, title, 304 - rw);
 }
 
 void ui_qr(const uint8_t *qrcode, float cx, float cy, int module_px) {

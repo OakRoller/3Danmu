@@ -56,6 +56,23 @@ int bili_recommend(int page, BiliVideo *out, int max, int *count);
 int bili_history(int page, BiliVideo *out, int max, int *count);
 int bili_fav(int page, BiliVideo *out, int max, int *count);
 
+/* 关注的 UP 的动态(需登录)。视频动态直接进主列表,和别的频道一样能播。
+ * 【page 是「第几次翻」不是页码】接口用的是不透明游标,bili.c 内部记着;
+ * 传 1 表示从头开始,传 >1 表示接着上一次往下 —— 中间跳页是做不到的。 */
+int bili_dynamic(int page, BiliVideo *out, int max, int *count);
+
+/* 一条非视频动态(文字/图文/转发/专栏/直播)。这些进不了视频列表,
+ * 单开一页显示 */
+typedef struct {
+	char user[48];
+	char time[24];      /* "3小时前" 这类相对时间,接口直接给的 */
+	char kind[12];      /* 视频/文字/图文/转发/专栏/直播 */
+	char text[512];     /* 正文(视频动态常为空) */
+	char title[200];    /* 附带的稿件/专栏标题 */
+	char bvid[16];      /* 有稿件时非空 */
+} BiliDynPost;
+int bili_dynamic_posts(int page, BiliDynPost *out, int max, int *count);
+
 /* 视频搜索(需要 WBI 签名) */
 int bili_search(const char *keyword, int page, BiliVideo *out, int max, int *count);
 

@@ -15,7 +15,7 @@
 #define DM_DRAW_N3    80      /* 单帧最多绘制条数 */
 #define DM_DRAW_OLD   48
 #define DM_MAX_ROWS 18        /* 行数上限(小字号时) */
-#define DM_LIFE     8.0f      /* 一条弹幕横穿屏幕的秒数 */
+#define DM_LIFE_BASE 8.0f     /* 一条弹幕横穿屏幕的秒数(1.0x 档) */
 #define DM_TEXTLEN  96
 
 typedef struct {
@@ -37,6 +37,14 @@ static int   s_rows  = 14;    /* 滚动行数 = 可用高度/行高,随字号与
 /* 覆盖范围档位:0=全屏 1=1/2 2=1/4 3=1/8(从顶部往下算) */
 static int   s_area  = 0;
 static const float DM_AREA_FRAC[4] = { 1.0f, 0.5f, 0.25f, 0.125f };
+/* 弹幕速度。存的是「横穿一屏要几秒」——**倍率越大越慢**,
+ * 所以档位表是倒过来的:1.5x 快 = 只用 0.5 倍的时间。
+ * 档位照搬 wiliwili(danmaku_style_speed:150/125/100/75/50,默认 100),
+ * 只是把它那边的基准 12s 换成本项目实机调出来的 8s ——
+ * 屏宽差三倍多,照抄绝对秒数会让弹幕在 400px 上慢得发呆。 */
+static const float DM_SPEED_MUL[5] = { 1.5f, 1.25f, 1.0f, 0.75f, 0.5f };
+static int   s_speed = 2;                      /* 默认 1.0x */
+static float s_life  = DM_LIFE_BASE;
 static int s_cursor = 0;      /* 第一个可能仍在屏上的下标 */
 static double s_last_clock = 0;
 static volatile int s_fresh = 0;   /* 刚发布新数据,首次绘制要对齐当前时刻 */
@@ -201,8 +209,11 @@ static int dm_parse(const char *xml) {
 		it->text[len] = 0;
 		xml_unescape(it->text);
 		if (!it->text[0]) continue;
+		/* 【不透明】原来给 0xE6(90%),叠上字形本身只有半格墨的笔画,
+		 * 实际落到屏幕上就更淡了。弹幕的可读性优先于「融进画面」的观感,
+		 * 何况现在有描边托底,全不透明也不会显得糊在脸上。 */
 		it->color = C2D_Color32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF,
-		                        rgb & 0xFF, 0xE6);
+		                        rgb & 0xFF, 0xFF);
 		it->w = -1.0f;
 		n++;
 		p = end;
@@ -338,15 +349,27 @@ void dm_add_local(const char *text, double t) {
 }
 
 void dm_set_size(int level) {
-	/* 中档 = 0.52:正好落进 ui.c 的吸附窗口,按字形原生 1:1 画,最清晰。
-	 * 小(0.39)/大(0.78)刻意取在窗口**外** —— 用户要的就是不同尺寸,
-	 * 不能被吸附拉回同一档;非原生尺寸发软是自选的代价。
-	 * 【行高必须按"吸附后"的实际字高算】曾经行高用原始 0.45 算而字形被
-	 * 吸附放大画,行装不下字 —— 挤行。现在中档行高按 1:1 字高给。 */
-	float sc = (level <= 0) ? 0.39f : (level >= 2) ? 0.78f : 0.52f;
-	if (sc != s_scale) {
-		s_scale = sc;
-		s_row_h = 19.0f * (sc / 0.52f);
+	/* 中 = 原生 1:1(吸附点,最清晰),小/大刻意取在吸附窗口外 ——
+	 * 用户要的就是尺寸不同,不能被吸附拉回同一档。
+	 *
+	 * 【1.5 倍在轮廓字体上可以,在点阵字体上不行】曾经短暂换过点阵字,
+	 * 那时大档必须改成精确整数倍(ui_scale_x(2)):点阵字每根笔画正好
+	 * 占满整数个纹素,1.5 倍会把一半笔画整根抹掉。现在字体是 Noto
+	 * (轮廓 + 抗锯齿),边缘本来就是半透明的,非整数倍只是更柔和一点,
+	 * 不会掉笔画 —— 所以回到 0.78(=1.5 倍)。真换回点阵字记得改回去。
+	 * 【行高向字体要,别再乘常数】常数是上一个字体的 1:1 字高,
+	 * 换字体就不对了;ui_text_height 拿到的是吸附之后的真实字高。 */
+	float sc = (level <= 0) ? 0.39f
+	         : (level >= 2) ? 0.78f
+	         : UI_SHARP;
+	/* 【行高无条件重算,不能"值没变就早退"】开机时 s_scale 的静态初值
+	 * 正好等于中档,于是这一句会被跳过,s_row_h 留在静态初值上 ——
+	 * 和真实字高对不上,最底下几行就画到屏幕外(下面 layout_apply
+	 * 的注释里记着同一个坑的另一半)。换字体后字高变了,更要每次都算。 */
+	bool changed = (sc != s_scale);
+	s_scale = sc;
+	s_row_h = ui_text_height(sc) + 2.0f;
+	if (changed) {
 		/* 字号变了:宽度缓存作废,行号一定要重排(行高跟着变了) */
 		for (int i = 0; i < s_count; i++) s_items[i].w = -1.0f;
 		for (int i = 0; i < s_nlocal; i++) s_local[i].w = -1.0f;
@@ -356,6 +379,19 @@ void dm_set_size(int level) {
 	}
 	layout_apply();
 }
+
+void dm_set_speed(int level) {
+	if (level < 0) level = 0;
+	if (level > 4) level = 4;
+	s_speed = level;
+	/* 【不清行占用、不动宽度缓存】s_row_t/s_row_w 存的是「出现时刻 + 宽度」,
+	 * 右边缘是每帧拿当前 s_life 现算的 —— 换速度后这些记录照样成立。
+	 * 字宽更是与速度无关,清了就是白白重做几百次字形解析。
+	 * 代价只有在飞的那几条会瞬间挪一下位,下一批就正常了。 */
+	s_life = DM_LIFE_BASE * DM_SPEED_MUL[level];
+}
+
+int dm_speed(void) { return s_speed; }
 
 void dm_set_area(int level) {
 	if (level < 0) level = 0;
@@ -375,10 +411,10 @@ void dm_reset(void) {
 static void draw_local(double clock, float xoff) {
 	for (int i = 0; i < s_nlocal; i++) {
 		LocalDm *d = &s_local[i];
-		if (clock < d->t || clock > d->t + DM_LIFE) continue;
+		if (clock < d->t || clock > d->t + s_life) continue;
 		if (d->w < 0) d->w = ui_text_width(d->text, s_scale);
 		if (d->row == 0xFF) d->row = (uint8_t)(i % s_rows);
-		float prog = (float)((clock - d->t) / DM_LIFE);
+		float prog = (float)((clock - d->t) / s_life);
 		float x = 400.0f - prog * (400.0f + d->w);
 		if (x + d->w < 0 || x > 400) continue;
 		/* 高亮色 + 微描边感(错位重画),一眼认出是自己的 */
@@ -415,7 +451,7 @@ void dm_draw(double clock, float xoff) {
 	s_last_clock = clock;
 
 	/* 推进游标:跳过已完全滚出屏幕的 */
-	while (s_cursor < s_count && s_items[s_cursor].t + DM_LIFE < clock)
+	while (s_cursor < s_count && s_items[s_cursor].t + s_life < clock)
 		s_cursor++;
 
 	limits_init();
@@ -433,7 +469,7 @@ void dm_draw(double clock, float xoff) {
 			for (int r = 0; r < s_rows; r++) {
 				float edge = -1e9f;      /* 空行:最优 */
 				if (s_row_used[r]) {
-					float pr = (float)((clock - s_row_t[r]) / DM_LIFE);
+					float pr = (float)((clock - s_row_t[r]) / s_life);
 					edge = 400.0f - pr * (400.0f + s_row_w[r]) + s_row_w[r];
 				}
 				if (edge < best_edge) { best_edge = edge; best = r; }
@@ -443,10 +479,21 @@ void dm_draw(double clock, float xoff) {
 			s_row_t[best] = it->t;
 			s_row_w[best] = it->w;
 		}
-		float prog = (float)((clock - it->t) / DM_LIFE);
+		float prog = (float)((clock - it->t) / s_life);
 		float x = 400.0f - prog * (400.0f + it->w);
 		if (x + it->w < 0 || x > 400) continue;
-		ui_text(x + xoff, 2.0f + it->row * s_row_h, s_scale, it->color, it->text);
+		/* 【描边不是装饰,是弹幕能不能看清的前提】
+		 * 字体是抗锯齿轮廓字,图集里九成以上的笔画像素只有半格墨 ——
+		 * 界面文字靠 ui_text_boost 重画补回来,而弹幕这一路**关掉了加重**
+		 * (顶点预算,见下面 ui_text_boost 的说明),于是它是全工程唯一
+		 * 又淡又没有任何衬底的文字,压在亮画面上几乎透明。
+		 * 错开 1px 画一遍深色再画本体:代价和加重一样是一遍顶点,
+		 * 但**压在任何底色上都有对比**,比单纯加深自身管用得多。
+		 * (自己发的弹幕早就这么画了,见 draw_local——这里只是补齐。) */
+		float dy = 2.0f + it->row * s_row_h;
+		ui_text(x + xoff + 1.0f, dy + 1.0f, s_scale,
+		        C2D_Color32(0, 0, 0, 0xC0), it->text);
+		ui_text(x + xoff, dy, s_scale, it->color, it->text);
 		drawn++;
 	}
 	ui_text_boost(true);

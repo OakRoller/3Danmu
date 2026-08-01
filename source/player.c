@@ -270,6 +270,7 @@ static bool s_pref_sub = false;    /* CC 字幕开关 */
 static int  s_dm_size = 1;         /* 弹幕字号 0小 1中 2大(默认中) */
 static int  s_sub_size = 1;        /* 字幕字号 0小 1中 2大(默认中) */
 static int  s_dm_area = 0;         /* 弹幕覆盖范围 0全屏 1半屏 2四分之一 3八分之一 */
+static int  s_dm_speed = 2;        /* 弹幕速度 0..4 = 0.5x..1.5x(默认 1.0x) */
 
 /* ---------- 画面比例 ----------
  *
@@ -336,6 +337,8 @@ void player_prefs_init(void) {
 	if (v >= 0 && v <= 2) s_sub_size = v;
 	v = settings_get("dm_area", s_dm_area);
 	if (v >= 0 && v <= 3) s_dm_area = v;
+	v = settings_get("dm_speed", s_dm_speed);
+	if (v >= 0 && v <= 4) s_dm_speed = v;
 	/* 画面比例**要存**(和 3D 相反)。3D 是逐片决定的(2D 片开着只会花屏),
 	 * 比例是「我这台机器上想怎么看」——用户把 16:9 强制上之后,
 	 * 下一个视频还得再点一次的话,这个设置就等于没有。 */
@@ -2280,6 +2283,7 @@ static int player_play_inner(const char *url, const char *title) {
 	dm_reset();
 	dm_set_size(s_dm_size);     /* 让模块与设置页显示一致 */
 	dm_set_area(s_dm_area);
+	dm_set_speed(s_dm_speed);
 	sub_set_size(s_sub_size);
 	s_pref_3d = 0;          /* 每个视频默认 2D,要 3D 手动开 */
 	ui_set_3d(false);
@@ -2673,11 +2677,12 @@ static int player_play_inner(const char *url, const char *title) {
 				if (pg_scroll > maxscroll) pg_scroll = maxscroll;
 
 				ui_begin_bottom();
-				ui_rect(0, 0, 320, 22, UI_COL_ACCENT);
-				char hdr[64];
-				snprintf(hdr, sizeof(hdr), "选集  当前 P%d / 共 %d",
-				         s_pg_cur + 1, s_pg_n);
-				ui_text(8, (22.0f - th) / 2.0f, UI_SHARP, UI_COL_WHITE, hdr);
+				{
+					char hdr[48];
+					snprintf(hdr, sizeof(hdr), "当前 P%d / 共 %d",
+					         s_pg_cur + 1, s_pg_n);
+					ui_panel_head("选集", hdr);
+				}
 
 				/* ---- 列表 ---- */
 				ui_clip(LX, LY, LW + 4.0f, LH);
@@ -2772,21 +2777,22 @@ static int player_play_inner(const char *url, const char *title) {
 				 * 少占 6px,正好腾出第四行,底下还留得住两行说明。
 				 * 【别再往里加按钮了】再加就得上翻页,而翻页在一个
 				 * 「看片时顺手点一下」的面板上是纯负担。 */
-				#define PS_Y(row) (26.0f + (row) * 42.0f)
-				#define PS_H 38.0f
+				#define PS_Y(row) (32.0f + (row) * 34.0f)
+				#define PS_H 30.0f
+				#define PS_L 8.0f
+				#define PS_R 163.0f
+				#define PS_W 149.0f
 				ui_begin_bottom();
-				ui_text(10, 4, UI_SHARP, UI_COL_TEXT, "播放设置");
-				if (ui_button(10, PS_Y(0), 145, PS_H,
-				              s_pref_3d ? "3D:开" : "3D:关",
-				              s_pref_3d ? UI_COL_ACCENT : UI_COL_SEL,
-				              btn_touch, tp.px, tp.py)) {
+				ui_panel_head("播放设置", "B 返回");
+				if (ui_opt(PS_L, PS_Y(0), PS_W, PS_H, "3D",
+				           s_pref_3d ? "开" : "关", s_pref_3d != 0,
+				           btn_touch, tp.px, tp.py)) {
 					s_pref_3d = !s_pref_3d;
 					ui_set_3d(s_pref_3d != 0);
 				}
-				if (ui_button(165, PS_Y(0), 145, PS_H,
-				              s_pref_sub ? "字幕:开" : "字幕:关",
-				              s_pref_sub ? UI_COL_ACCENT : UI_COL_SEL,
-				              btn_touch, tp.px, tp.py)) {
+				if (ui_opt(PS_R, PS_Y(0), PS_W, PS_H, "字幕",
+				           s_pref_sub ? "开" : "关", s_pref_sub,
+				           btn_touch, tp.px, tp.py)) {
 					s_pref_sub = !s_pref_sub;
 					settings_set("sub", s_pref_sub);
 					/* 开关本身只管画不画,不会产生日志——这里补一行状态,
@@ -2807,49 +2813,54 @@ static int player_play_inner(const char *url, const char *title) {
 					}
 				}
 				{
-					static const char *sz[3] = { "弹幕字号:小",
-					                             "弹幕字号:中",
-					                             "弹幕字号:大" };
-					if (ui_button(10, PS_Y(1), 145, PS_H, sz[s_dm_size],
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
+					static const char *sz[3] = { "小", "中", "大" };
+					if (ui_opt(PS_L, PS_Y(1), PS_W, PS_H, "弹幕字号",
+					           sz[s_dm_size], false, btn_touch, tp.px, tp.py)) {
 						s_dm_size = (s_dm_size + 1) % 3;
 						settings_set("dm_size", s_dm_size);
 						dm_set_size(s_dm_size);
 						dm_set_area(s_dm_area);   /* 行数依赖字号,重算一次 */
 					}
 				}
-				{	/* 字幕字号(占原"返回"的位置) */
-					static const char *ssz[3] = { "字幕字号:小",
-					                              "字幕字号:中",
-					                              "字幕字号:大" };
-					if (ui_button(165, PS_Y(1), 145, PS_H, ssz[s_sub_size],
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
+				{	/* 弹幕速度:档位同 wiliwili,改的是横穿一屏用几秒。
+					 * 【为什么值得单开一格】小屏上「看得清」和「看得全」
+					 * 是打架的:400px 宽,一条长弹幕在 1.0x 下不到两秒就
+					 * 扫过去了,想看完只能调慢;而弹幕密的片子调快才不糊屏。
+					 * 字号和覆盖范围都替代不了它。 */
+					static const char *sp[5] = { "0.5x", "0.75x", "1.0x",
+					                             "1.25x", "1.5x" };
+					if (ui_opt(PS_R, PS_Y(1), PS_W, PS_H, "弹幕速度",
+					           sp[s_dm_speed], false, btn_touch, tp.px, tp.py)) {
+						s_dm_speed = (s_dm_speed + 1) % 5;
+						settings_set("dm_speed", s_dm_speed);
+						dm_set_speed(s_dm_speed);
+					}
+				}
+				{	/* 字幕字号 */
+					static const char *ssz[3] = { "小", "中", "大" };
+					if (ui_opt(PS_R, PS_Y(3), PS_W, PS_H, "字幕字号",
+					           ssz[s_sub_size], false, btn_touch, tp.px, tp.py)) {
 						s_sub_size = (s_sub_size + 1) % 3;
 						settings_set("sub_size", s_sub_size);
 						sub_set_size(s_sub_size);
 					}
 				}
-				{	/* 画面比例:循环切换,当场生效(只改绘制时的缩放) */
-					char ab[32];
-					snprintf(ab, sizeof(ab), "画面比例:%s",
-					         ASPECTS[s_pref_aspect].name);
-					/* 【不按值高亮】按钮上写着当前值,高亮不提供任何额外信息,
+				{	/* 画面比例:循环切换,当场生效(只改绘制时的缩放)。
+					 * 【不按值高亮】按钮上写着当前值,高亮不提供任何额外信息,
 					 * 只是让「非默认」看起来像「开启了什么」。同一行里
 					 * 3D 那个是真·开关(开着会影响画面),那种才该高亮。 */
-					if (ui_button(10, PS_Y(2), 145, PS_H, ab,
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
+					if (ui_opt(PS_R, PS_Y(2), PS_W, PS_H, "画面比例",
+					           ASPECTS[s_pref_aspect].name, false,
+					           btn_touch, tp.px, tp.py)) {
 						s_pref_aspect = (s_pref_aspect + 1) % ASPECT_N;
 						settings_set("aspect", s_pref_aspect);
 						calc_output_size(p);
 					}
 				}
 				{	/* 弹幕范围:从上屏顶部往下占多少 */
-					static const char *ar[4] = { "弹幕范围:全屏",
-					                             "弹幕范围:1/2",
-					                             "弹幕范围:1/4",
-					                             "弹幕范围:1/8" };
-					if (ui_button(165, PS_Y(2), 145, PS_H, ar[s_dm_area],
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
+					static const char *ar[4] = { "全屏", "1/2", "1/4", "1/8" };
+					if (ui_opt(PS_L, PS_Y(2), PS_W, PS_H, "弹幕范围",
+					           ar[s_dm_area], false, btn_touch, tp.px, tp.py)) {
 						s_dm_area = (s_dm_area + 1) % 4;
 						settings_set("dm_area", s_dm_area);
 						dm_set_area(s_dm_area);
@@ -2859,19 +2870,23 @@ static int player_play_inner(const char *url, const char *title) {
 						       s_dm_area, dm_rows());
 					}
 				}
-				if (ui_button(10, PS_Y(3), 145, PS_H, "调试台", UI_COL_SEL,
+				/* 解码那一格:软解时是可点的同步/流畅开关,硬解时降级成
+				 * 只读信息 —— 硬解下没有这个选择,画成能点的只会骗手指。 */
+				if (!p->use_mvd) {
+					if (ui_opt(PS_L, PS_Y(3), PS_W, PS_H, "软解",
+					           p->sync_mode ? "同步优先" : "流畅优先", false,
+					           btn_touch, tp.px, tp.py))
+						p->sync_mode = !p->sync_mode;
+				} else {
+					ui_opt(PS_L, PS_Y(3), PS_W, PS_H, "解码", "硬件", false,
+					       false, 0, 0);
+				}
+				if (ui_button(PS_L, PS_Y(4), PS_W, PS_H, "调试台", UI_COL_SEL,
 				              btn_touch, tp.px, tp.py))
 					want_console = true;
-				/* 右下角:软解才有的同步/流畅;硬解时该位置放"返回" */
-				if (!p->use_mvd) {
-					if (ui_button(165, PS_Y(3), 145, PS_H,
-					              p->sync_mode ? "软解:同步优先" : "软解:流畅优先",
-					              UI_COL_SEL, btn_touch, tp.px, tp.py))
-						p->sync_mode = !p->sync_mode;
-				} else if (ui_button(165, PS_Y(3), 145, PS_H, "返回", UI_COL_SEL,
-				                     btn_touch, tp.px, tp.py)) {
+				if (ui_button(PS_R, PS_Y(4), PS_W, PS_H, "返回", UI_COL_SEL,
+				              btn_touch, tp.px, tp.py))
 					in_psettings = false;
-				}
 				{	/* 字幕状态实况:排查"开了却不显示"卡在哪一步 */
 					char sb[72];
 					if (sub_loading())
@@ -2884,32 +2899,39 @@ static int player_play_inner(const char *url, const char *title) {
 						snprintf(sb, sizeof(sb), "字幕:需登录后才能获取");
 					else
 						snprintf(sb, sizeof(sb), "字幕:本片无中文字幕轨");
-					ui_text(10, PS_Y(4) - 2, UI_SHARP, UI_COL_DIM, sb);
+					ui_text(PS_L + 2, PS_Y(5) + 2, UI_SHARP, UI_COL_DIM, sb);
 				}
-				/* 只剩两行说明的位置了(第四行按钮吃掉一行),所以这行
-				 * 得把「3D 要什么片源」和「怎么退出」并成一句。
-				 * 弹幕范围/画面比例不写说明:按钮上就是当前值,点一下
+				/* 底下只剩一行位置(第五行按钮吃掉一行)。退出方式写在
+				 * 页头右上角了,这里留给唯一一条「点了也看不出为什么没用」
+				 * 的说明。其余选项一概不写:按钮上就是当前值,点一下
 				 * 上屏当场变,比一行小字管用。 */
-				ui_text(10, PS_Y(4) + 18, UI_SHARP, UI_COL_DIM,
-				        "3D 需左右分屏片源   B 键退出设置");
+				ui_text(PS_L + 2, PS_Y(5) + 20, UI_SHARP, UI_COL_DIM,
+				        "3D 需左右分屏片源");
 				#undef PS_Y
 				#undef PS_H
+				#undef PS_L
+				#undef PS_R
+				#undef PS_W
 			} else if (ui_console_active()) {  /* 日志页(自绘) */
 				if (ui_draw_log(touched, (kHeld & KEY_TOUCH) != 0,
 				                tp.px, tp.py))
 					ui_bottom_debug(false);
 			} else { /* 下屏触控 GUI */
 				ui_begin_bottom();
-				/* 标题跑马灯:和列表页同一套节奏(停 1.2s → 匀速滚 →
+				/* 页头只画条,标题自己滚(ui_panel_head 画不了跑马灯)。
+				 * 标题跑马灯:和列表页同一套节奏(停 1.2s → 匀速滚 →
 				 * 到尾停一下 → 回起点)。多 P 视频的标题前面还挂着
 				 * 「P12 某某 | 」,不滚的话真正的片名基本看不到。
 				 * 量宽是完整的字形解析,只在标题变了时才重算。 */
+				ui_panel_head(NULL, NULL);
 				{
 					static float ttl_off = 0.0f;
 					static u64   ttl_t0 = 0;
 					static float ttl_w = 0.0f;
 					static size_t ttl_len = 0;
-					const float TW = 300.0f;
+					const float TW = 304.0f;
+					float tth = ui_text_height(UI_SHARP);
+					float tty = (22.0f - tth) / 2.0f;
 					size_t tl = strlen(s_cur_title);
 					if (ttl_len != tl) {
 						ttl_len = tl;
@@ -2927,11 +2949,11 @@ static int player_play_inner(const char *url, const char *title) {
 							}
 						}
 						float off = ttl_off > span ? span : ttl_off;
-						ui_clip(10, 4, TW, ui_text_height(UI_SHARP) + 4.0f);
-						ui_text(10 - off, 4, UI_SHARP, UI_COL_TEXT, s_cur_title);
+						ui_clip(8, 0, TW, 22.0f);
+						ui_text(8 - off, tty, UI_SHARP, UI_COL_WHITE, s_cur_title);
 						ui_unclip();
 					} else {
-						ui_text(10, 4, UI_SHARP, UI_COL_TEXT, s_cur_title);
+						ui_text(8, tty, UI_SHARP, UI_COL_WHITE, s_cur_title);
 					}
 				}
 				char tbuf[80];
@@ -2943,13 +2965,30 @@ static int player_play_inner(const char *url, const char *title) {
 				int cs = (int)shown_pos, ts = (int)p->duration;
 				snprintf(tbuf, sizeof(tbuf), "%02d:%02d / %02d:%02d",
 				         cs / 60, cs % 60, ts / 60, ts % 60);
-				ui_text(10, 26, UI_SHARP, UI_COL_DIM, tbuf);
-				ui_text(140, 26, UI_SHARP, UI_COL_DIM,
-				        p->use_mvd ? "硬件解码" : "软件解码");
-				/* 没声音的标记跟解码方式放同一行:这行本来就是"当前这条片子
-				 * 是怎么在放的"。用醒目色 —— 静音是用户第一眼就想知道原因的事 */
-				if (!p->audio_ok)
-					ui_text(228, 26, UI_SHARP, UI_COL_ACCENT, "无声音");
+				ui_text(10, 30, UI_SHARP, UI_COL_TEXT, tbuf);
+				/* 「当前这条片子是怎么在放的」这一行改成右对齐的小标签:
+				 * 原来是三段定点坐标(10/140/228),文案一变长就互相压。
+				 * 从右往左摞过去,加不加、加几个都不会撞。 */
+				{
+					float th2 = ui_text_height(UI_SHARP);
+					float rx = 312.0f;
+					/* 没声音优先摆最右:静音是用户第一眼就想知道原因的事,
+					 * 用醒目色 + 底框,比同色小字抓得住眼睛 */
+					if (!p->audio_ok) {
+						float w2 = ui_text_width("无声音", UI_SHARP);
+						rx -= w2 + 10.0f;
+						ui_rect(rx, 28, w2 + 10.0f, th2 + 6.0f,
+						        C2D_Color32(0x5A, 0x22, 0x33, 0xFF));
+						ui_text(rx + 5.0f, 31, UI_SHARP, UI_COL_ACCENT, "无声音");
+						rx -= 6.0f;
+					}
+					{
+						const char *dec = p->use_mvd ? "硬件解码" : "软件解码";
+						float w2 = ui_text_width(dec, UI_SHARP);
+						rx -= w2;
+						ui_text(rx, 31, UI_SHARP, UI_COL_DIM, dec);
+					}
+				}
 
 				/* ---- 可拖动进度条 ---- */
 				#define BAR_X 14.0f
@@ -2985,12 +3024,22 @@ static int player_play_inner(const char *url, const char *title) {
 					float fill = (float)(shown / p->duration);
 					if (fill < 0) fill = 0;
 					if (fill > 1) fill = 1;
-					/* 轨道 + 已播部分 + 圆头把手 */
-					ui_rect(BAR_X, BAR_Y, BAR_W, BAR_H, C2D_Color32(0x3A,0x3A,0x48,0xFF));
-					ui_rect(BAR_X, BAR_Y, BAR_W * fill, BAR_H, UI_COL_ACCENT);
+					/* 轨道 + 已播部分 + 把手。
+					 * 【把手为什么要描一圈深色】原来是一块纯白方片,
+					 * 压在粉色已播段上时两者亮度接近,边界糊成一团,
+					 * 拖到哪儿要盯着看。垫一圈深色再画白块,
+					 * 无论压在轨道上还是压在粉段上都拎得出来。
+					 * 圆角靠上下各收 2px 的三段拼出来 —— 只有矩形可用。 */
+					ui_rect(BAR_X, BAR_Y + 1, BAR_W, BAR_H - 2,
+					        C2D_Color32(0x33, 0x33, 0x3F, 0xFF));
+					ui_rect(BAR_X, BAR_Y + 1, BAR_W * fill, BAR_H - 2, UI_COL_ACCENT);
 					float hx = BAR_X + BAR_W * fill;
 					float hw = dragging ? 14.0f : 10.0f;
-					ui_rect(hx - hw / 2, BAR_Y - 5, hw, BAR_H + 10, UI_COL_WHITE);
+					float hy = BAR_Y - 5.0f, hh = BAR_H + 10.0f;
+					ui_rect(hx - hw / 2 - 2, hy - 2, hw + 4, hh + 4,
+					        C2D_Color32(0x12, 0x12, 0x18, 0xFF));
+					ui_rect(hx - hw / 2 + 2, hy, hw - 4, hh, UI_COL_WHITE);
+					ui_rect(hx - hw / 2, hy + 2, hw, hh - 4, UI_COL_WHITE);
 					if (dragging) { /* 拖动时显示目标时间 */
 						char db[24];
 						int ds = (int)drag_pos;
@@ -3160,7 +3209,26 @@ static int player_play_inner(const char *url, const char *title) {
 				         p->pause ? "暂停" : "继续",
 				         (unsigned long)p->clock_ms);
 			}
-			if (p->worker_done) { ret = p->ret; break; }
+			if (p->worker_done) {
+				ret = p->ret;
+				/* 【放完自动接下一 P】worker 自己跑完 + ret==0 才算「放到片尾」:
+				 * ret 只有解复用到 EOF 且音频排空后才被置 0(见 worker 里那处),
+				 * 出错是负数,MVD 降级是 -99(那条会重进一次 inner,由重播的
+				 * 那一趟来判定)。而 B 键和「返回」按钮走的是上面 p->quit 那两个
+				 * 出口,根本到不了这里 —— 所以「看完了自动下一集」和
+				 * 「我不想看了」不会被混为一谈。
+				 *
+				 * 借用 s_page_pick 这条既有通道:播放器照旧不碰分P 数据,
+				 * 只是把「下一个下标」交出去,重新取流仍然是 main.c 的事。
+				 * 最后一 P 放完不接(没有下一个),照常退回列表。 */
+				if (ret == 0 && s_page_pick < 0 &&
+				    s_pg_n > 1 && s_pg_cur + 1 < s_pg_n) {
+					s_page_pick = s_pg_cur + 1;
+					ui_trace("player: P%d 播完,自动接 P%d",
+					         s_pg_cur + 1, s_pg_cur + 2);
+				}
+				break;
+			}
 		}
 
 		/* 退出顺序很重要:先置 quit 让所有等待循环解锁,
