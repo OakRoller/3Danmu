@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include "ui.h"
+#include "thread_util.h"
 #undef printf      /* ui.c 内部要用真 printf 写控制台,不能再绕回 ui_printf
                     * (否则重放历史会把历史再写一遍进环形缓冲) */
 #include "vendor/qrcodegen.h"
@@ -319,9 +320,7 @@ void ui_init(void) {
 void ui_exit(void) {
 	if (s_tq_thread) {                 /* 先让写盘线程把队列清完 */
 		s_tq_quit = 1;
-		threadJoin(s_tq_thread, 3000000000LL);
-		threadFree(s_tq_thread);
-		s_tq_thread = NULL;
+		thread_reap(&s_tq_thread, 3000000000LL, "trace writer");
 	}
 	if (s_font) C2D_FontFree(s_font);
 	C2D_TextBufDelete(s_measbuf);
@@ -731,4 +730,148 @@ void ui_qr(const uint8_t *qrcode, float cx, float cy, int module_px) {
 		for (int x = 0; x < size; x++)
 			if (qrcodegen_getModule(qrcode, x, y))
 				ui_rect(x0 + off + x * px, y0 + off + y * px, px, px, UI_COL_BLACK);
+}
+
+/* ---------- 设置列表 + 说明 ----------
+ * 触屏为主:拖动滚动、点按修改、右侧滚动条可拖。不接管方向键 ——
+ * 它们在别的页面另有用途,同一个键在两个上下文做不同的事只会误触。
+ * 状态放这里而不是让调用方保管:同一时刻只有一页列表活着,
+ * 多传五个参数换一点纯度不划算。 */
+static float s_ls_scroll = 0.0f;
+static bool  s_ls_drag = false, s_ls_bar = false;
+static float s_ls_y0 = 0.0f, s_ls_s0 = 0.0f, s_ls_moved = 0.0f;
+static float s_ls_lx = 0.0f, s_ls_ly = 0.0f;   /* 最后一次有效触点 */
+static int   s_ls_focus = -1;
+
+void ui_list_reset(void) {
+	s_ls_scroll = 0.0f;
+	s_ls_drag = s_ls_bar = false;
+	s_ls_moved = 0.0f;
+	s_ls_focus = -1;
+}
+
+int ui_list_focus(void) { return s_ls_focus; }
+
+int ui_list_draw(const char *title, const UiRow *rows, int n,
+                 bool touched, bool holding, bool released,
+                 float tx, float ty) {
+	const float LX = 6.0f, LW = 296.0f, LY = 24.0f;
+	const float BAR_X = 306.0f, BAR_W = 8.0f;
+	float th = ui_text_height(UI_SHARP);
+	float rowh = th + 12.0f;                  /* 行高跟着字号走,别写死 */
+	float hint_y = 240.0f - th - 6.0f;
+	float LH = hint_y - 6.0f - LY;
+	float maxs = (float)n * rowh - LH;
+	if (maxs < 0) maxs = 0;
+	int picked = -1;
+
+	/* 【坐标要自己记】hidTouchRead 只在按住期间有效,松手那一帧是 (0,0),
+	 * 而点选恰恰在松手时判定 —— 直接用 tx/ty 会永远命中左上角。 */
+	if (touched) {
+		s_ls_moved = 0.0f;
+		s_ls_y0 = ty; s_ls_s0 = s_ls_scroll;
+		s_ls_lx = tx; s_ls_ly = ty;
+		s_ls_bar = (tx >= BAR_X - 6 && maxs > 0);
+		s_ls_drag = !s_ls_bar && ty >= LY && ty < LY + LH;
+		if (s_ls_bar) s_ls_scroll = (ty - LY) / LH * maxs;
+	}
+	if (holding) {
+		s_ls_lx = tx; s_ls_ly = ty;
+		float dy = ty - s_ls_y0, ady = dy < 0 ? -dy : dy;
+		if (ady > s_ls_moved) s_ls_moved = ady;   /* 记最大偏移,不是累加 */
+		if (s_ls_bar) s_ls_scroll = (ty - LY) / LH * maxs;
+		else if (s_ls_drag) s_ls_scroll = s_ls_s0 - dy;
+	}
+	if (!holding) { s_ls_drag = s_ls_bar = false; }
+	if (s_ls_scroll < 0) s_ls_scroll = 0;
+	if (s_ls_scroll > maxs) s_ls_scroll = maxs;
+
+	ui_begin_bottom();
+	ui_rect(0, 0, 320, 22, UI_COL_ACCENT);
+	ui_text(8, (22.0f - th) / 2.0f, UI_SHARP, UI_COL_WHITE, title);
+
+	ui_clip(LX, LY, LW + 4.0f, LH);
+	int first = (int)(s_ls_scroll / rowh);
+	if (first < 0) first = 0;
+	for (int i = first; i < n; i++) {
+		float y = (float)(int)(LY + i * rowh - s_ls_scroll);
+		if (y >= LY + LH) break;
+		float h = rowh - 2.0f;
+		bool inrow = s_ls_lx >= LX && s_ls_lx < LX + LW &&
+		             s_ls_ly >= y && s_ls_ly < y + h &&
+		             s_ls_ly >= LY && s_ls_ly < LY + LH;
+		/* 按下就更新高亮:上屏的说明要立刻跟上,不能等松手 */
+		if (touched && inrow) s_ls_focus = i;
+		if (released && inrow && s_ls_moved < 8.0f) picked = i;
+		ui_rect(LX, y, LW, h, (i == s_ls_focus) ? UI_COL_SEL
+		                                        : C2D_Color32(0x22,0x22,0x2C,0xFF));
+		/* 按住反馈:和 ui_button 同款白边,但按住期间一直显示 ——
+		 * 这一页要拖要滑,一帧的反馈根本看不见 */
+		if (holding && inrow && s_ls_moved < 8.0f && !s_ls_bar) {
+			ui_rect(LX, y, LW, 2, UI_COL_WHITE);
+			ui_rect(LX, y + h - 2, LW, 2, UI_COL_WHITE);
+			ui_rect(LX, y, 2, h, UI_COL_WHITE);
+			ui_rect(LX + LW - 2, y, 2, h, UI_COL_WHITE);
+		}
+		float ty2 = y + (h - th) / 2.0f;
+		ui_text(LX + 10, ty2, UI_SHARP, UI_COL_TEXT, rows[i].name);
+		/* 动作项(value 为 NULL)右侧什么都不画。
+		 * 原来画一个 "›" —— 字体是子集化过的,那个字形不在里面,
+		 * 渲染出来是个问号。**子集字体里只能用确定收录了的字符**。 */
+		if (rows[i].value) {
+			float vw = ui_text_width(rows[i].value, UI_SHARP);
+			ui_text(LX + LW - 10 - vw, ty2, UI_SHARP, UI_COL_ACCENT,
+			        rows[i].value);
+		}
+	}
+	ui_unclip();
+
+	if (maxs > 0) {
+		float bh = LH * LH / ((float)n * rowh);
+		if (bh < 16.0f) bh = 16.0f;
+		float pos = s_ls_scroll / maxs;
+		ui_rect(BAR_X, LY, BAR_W, LH, C2D_Color32(0x30,0x30,0x3C,0xFF));
+		ui_rect(BAR_X, LY + (LH - bh) * pos, BAR_W, bh,
+		        s_ls_bar ? UI_COL_WHITE : UI_COL_ACCENT);
+	}
+	ui_text(8, hint_y, UI_SHARP, UI_COL_DIM, "滑动翻找   点按修改   B 返回");
+	return picked;
+}
+
+void ui_help_draw(const char *title, const char *body, const char *footer1,
+                  const char *footer2) {
+	/* 【z 必须抬到弹幕之上】这一页是画在**正在播放的画面上**的,
+	 * 而弹幕走的是 ui_text 的默认 0.5。顶栏用 ui_rect 是 0.4,
+	 * 于是弹幕从标题栏里穿过去 —— 看着就像弹幕那层透明底盖住了条。
+	 * 说明正文同理。0.8/0.85 高过上屏所有既有图层(弹幕 0.5、
+	 * 「弹幕加载中」0.6/0.7)。 */
+	const float ZBAR = 0.8f, ZTXT = 0.85f;
+	const float PAD = 16.0f;
+	float th = ui_text_height(UI_SHARP);
+	float hh = th + 14.0f;
+	ui_rect_z(0, 0, ZBAR, 400, hh, UI_COL_ACCENT);
+	ui_text_z(PAD, (hh - th) / 2.0f, ZTXT, UI_SHARP, UI_COL_WHITE,
+	          title ? title : "");
+	/* 正文按 \n 逐行画。这里不做自动折行 —— 见 ui.h 里的说明 */
+	float y = hh + 14.0f;
+	if (body) {
+		char line[160];
+		const char *p = body;
+		while (*p && y < 240.0f - th * 3.0f) {
+			const char *nl = strchr(p, '\n');
+			size_t len = nl ? (size_t)(nl - p) : strlen(p);
+			if (len >= sizeof(line)) len = sizeof(line) - 1;
+			memcpy(line, p, len);
+			line[len] = 0;
+			ui_text_z(PAD, y, ZTXT, UI_SHARP, UI_COL_TEXT, line);
+			y += th + 4.0f;
+			if (!nl) break;
+			p = nl + 1;
+		}
+	}
+	/* 底部两行从下往上排,表格行数变了也不用跟着改 */
+	float ly = 240.0f - th - 8.0f;
+	if (footer2) { ui_text_z(PAD, ly, ZTXT, UI_SHARP, UI_COL_DIM, footer2);
+	               ly -= th + 4.0f; }
+	if (footer1) ui_text_z(PAD, ly, ZTXT, UI_SHARP, UI_COL_ACCENT, footer1);
 }

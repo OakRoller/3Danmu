@@ -21,6 +21,7 @@
 #include <libavutil/opt.h>
 
 #include "player.h"
+#include "thread_util.h"
 #include "net.h"
 #include "settings.h"
 #include "ui.h"
@@ -48,6 +49,10 @@
 #define WORKER_STACK (160 * 1024)
 #define RING_CAP (1536 * 1024)   /* 网络环形缓冲:360P 约 20+ 秒余量 */
 #define DL_STACK (32 * 1024)
+/* seek 重连最多试几次(退避 0.4→2 秒,合计约 9 秒)。
+ * 不像断线那样无限重试:用户正等着跳转,连不上就该把控制权还给他,
+ * 而不是让进度条僵在那儿。 */
+#define SEEK_RETRY_MAX 6
 
 #ifndef MVD_STATUS_FRAMEREADY
 #define MVD_STATUS_FRAMEREADY 0x17003
@@ -110,6 +115,7 @@ typedef struct {
 	u8 *mvd_in_n3;
 	bool mvd_first;             /* 首帧需重复送一次 */
 	bool mvd_need_hdr;          /* 下一次送包时要把 SPS/PPS 拼在帧前面 */
+	bool mvd_wait_key;          /* 冲刷后:等到关键帧才开始送(见 mvd_decode_packet) */
 	bool mvd_skip;              /* 上次 Process 已出帧:先排空内部队列再送新包 */
 	s64 pts_fifo[16];           /* 解码顺序的时间戳队列(dts 单调) */
 	int pts_head, pts_len;
@@ -130,6 +136,33 @@ typedef struct {
 	int back;                   /* worker 正在写的缓冲下标 */
 	int vw, vh, ow, oh;
 	int src_w, src_h, src_stride;
+	/* ---- Y2R 硬件色彩转换(全机型都有,含老 3DS)----
+	 * ARM11 是 ARMv6、没有 NEON,swscale 跑纯 C —— 实测 640x360 一帧
+	 * 要 8.4ms,占软解总耗时的三成。Y2R 是专门做 YUV→RGB 的硬件块,
+	 * 走 DMA,这部分 CPU 时间可以整个省掉。
+	 * y2r_in 必须是**线性内存**:DMA 要物理连续,而 ffmpeg 的帧在普通堆上,
+	 * 所以每帧要先按行拷进来(memcpy 远比逐像素转换便宜)。 */
+	u8 *y2r_in;                 /* 线性暂存:Y、U、V 三平面依次排列 */
+	size_t y2r_sz;
+	/* Y2R 的输出暂存(紧凑,行距 = 画面宽)。
+	 * 【为什么不直接写 vout】vout 的行距是纹理宽(2 的幂,比画面宽),
+	 * 要靠 SetReceiving 的 gap 参数跳过每行末尾的填充 —— 而那个参数
+	 * 在 BLOCK_LINE 下到底按字节还是按传输单位算,我没找到权威说明,
+	 * 实测也确实出现了跳动的暗竖线。与其赌语义,不如让它写紧凑缓冲
+	 * (gap=0,没有歧义),再自己逐行拷进 vout。多一次 450KB 的拷贝,
+	 * 换一个完全确定的行为 —— 而这条路径本来就已经比 swscale 快得多。 */
+	u16 *y2r_out;
+	size_t y2r_out_sz;
+	Handle y2r_evt;
+	bool y2r_ok;                /* 初始化成功且尚未出错 */
+	/* ---- 流水线 ----
+	 * 转换走 DMA,CPU 在等它的时候是白站着。让它和**下一帧的解码**重叠:
+	 * 解完新帧才回头收上一帧的转换结果 —— 那时 DMA 早就跑完了。
+	 * 代价是发布延后一帧(解出第 N 帧时发布第 N-1 帧),换来关键路径上
+	 * 只剩一次 memcpy。 */
+	bool y2r_busy;              /* 有一帧正在转换 */
+	int  y2r_buf;               /* 它写在 vout 的哪一面 */
+	double y2r_pts;             /* 它的时间戳(发布时要用) */
 	C3D_Tex tex;                /* 视频纹理(tex_w×tex_h RGB565,均为 2 的幂) */
 	int tex_w, tex_h;           /* tex_w 同时是 vout/上传的行距 */
 	Tex3DS_SubTexture subtex;
@@ -258,9 +291,16 @@ void player_set_pages(const char *const *labels, const int *durations,
 	s_pg_cur    = cur;
 }
 
+/* 本次播放是不是**自然播到结尾**(而不是用户按 B 退出 / 换 P / 出错)。
+ * 自动连播下一 P 只该发生在真的看完的时候 —— 用户中途退出却被
+ * 自动带到下一集,是最让人恼火的那种「聪明」。 */
+static bool s_ended_eof = false;
+bool player_ended_naturally(void) { return s_ended_eof; }
+
 int player_take_page_pick(void) {
 	int p = s_page_pick;
-	s_page_pick = -1;   /* 取走即清:一次性的意图,不是状态 */
+	s_page_pick = -1;
+	s_ended_eof = false;   /* 取走即清:一次性的意图,不是状态 */
 	return p;
 }
 static bool s_pref_sub = false;    /* CC 字幕开关 */
@@ -328,6 +368,7 @@ void player_set_login_cb(bool (*cb)(void)) { s_login_cb = cb; }
 /* 开机时从存档恢复本模块的偏好。3D 故意不存:它按视频逐个手动开
  * (竖屏/2D 片开着 3D 只会花屏),记住上次的值弊大于利。 */
 void player_prefs_init(void) {
+	s_pref_danmaku = settings_get("danmaku", s_pref_danmaku ? 1 : 0) != 0;
 	s_pref_sub = settings_get("sub", s_pref_sub ? 1 : 0) != 0;
 	int v;
 	v = settings_get("dm_size", s_dm_size);
@@ -365,13 +406,49 @@ static void downloader_main(void *arg) {
 	int stall_count = 0;              /* 本次播放累计断线次数 */
 	while (!r->quit) {
 		if (r->seek_req) {
-			if (ns_seek(&p->ns, r->seek_target) != 0) {
-				r->err = 1;
-			} else {
+			/* 【seek 失败也要重连,不能一次就判死】
+			 * 拖进度条 = 断开 + 按新 Range 重连 + 一次 HTTPS 握手,
+			 * 而重连本来就会偶发失败(CDN 限流、握手超时)。
+			 * 原来这里失败一次就 r->err = 1,而 err 一旦置上再也没人清 ——
+			 * avio_read_cb 从此每次都回 EIO,解封装器随即报错、播放结束。
+			 * 用户看到的正是「拖一下进度条 → 重连中 → 缓冲中 → 退回列表」。
+			 * 下面那条断线路径早就是无限重试的,只有 seek 这条漏了同一条
+			 * 规矩 —— 同样的网络抖动,走哪条路决定了是续播还是退出。 */
+			int attempt = 0, ok = 0;
+			while (!r->quit && !p->quit && !net_is_shutting_down()) {
+				u64 t0 = osGetTime();
+				if (ns_seek(&p->ns, r->seek_target) == 0) {
+					if (attempt)
+						ui_trace("seek 重连成功: 第%d次, 耗时%dms",
+						         attempt + 1, (int)(osGetTime() - t0));
+					ok = 1;
+					break;
+				}
+				attempt++;
+				if (attempt <= 3)
+					ui_trace("seek 重连失败: 第%d次, 耗时%dms",
+					         attempt, (int)(osGetTime() - t0));
+				if (attempt >= SEEK_RETRY_MAX) break;
+				p->net_stall = attempt;   /* 主线程据此画「重连中」 */
+				s64 wait_ms = 400 + (s64)attempt * 400;
+				if (wait_ms > 2000) wait_ms = 2000;
+				for (s64 slept = 0; slept < wait_ms; slept += 100) {
+					if (r->quit || p->quit) break;
+					svcSleepThread(100 * 1000 * 1000LL);
+				}
+			}
+			p->net_stall = 0;
+			if (ok) {
 				r->rd = 0;
 				r->wr = 0;
 				r->base = r->seek_target;
 				r->eof = 0;
+				last_read_ms = osGetTime();
+			} else if (!r->quit && !p->quit) {
+				/* 真的连不上了才判错。注意这时**不要**动 rd/wr/base:
+				 * 让位置停在原处,avio_seek_cb 会回 -1,ffmpeg 当作
+				 * 「这次跳转没成功」,原来的播放还有机会接着走。 */
+				ui_trace("seek 放弃: 连试%d次都失败", attempt);
 			}
 			__dmb();
 			r->seek_req = 0; /* ack */
@@ -518,12 +595,23 @@ static int64_t avio_seek_cb(void *opaque, int64_t offset, int whence) {
 	r->seek_target = (u64)target;
 	__dmb();
 	r->seek_req = 1;
-	for (int i = 0; i < 3000; i++) {   /* 最多等 6 秒,且响应退出 */
+	/* 等下载线程完成重定位。上限要盖得住它那边的重连退避(见 SEEK_RETRY_MAX),
+	 * 否则会在人家还在重连时就超时走人。 */
+	int i = 0;
+	for (; i < 7500; i++) {            /* 最多等 15 秒,且响应退出 */
 		if (!r->seek_req || r->err || r->quit || p->quit) break;
 		svcSleepThread(2 * 1000 * 1000LL);
 	}
 	s_io_seek_ms += osGetTime() - t0;
 	if (r->err || r->quit || p->quit) return -1;
+	/* 【超时必须回 -1】原来这里超时后照样 return target,等于跟 ffmpeg 说
+	 * "跳好了" —— 可下载线程还停在旧位置,接下来读到的是旧数据,而且随时
+	 * 会被那边的 rd/wr 清零从中间截断。喂给解码器的就是一段接不上的码流,
+	 * 屏幕上便是**花屏**。跳转没成功就说没成功,ffmpeg 自己会处理。 */
+	if (r->seek_req) {
+		ui_trace("seek 超时: 下载线程 15 秒没回来");
+		return -1;
+	}
 	return target;
 }
 
@@ -1152,6 +1240,7 @@ static bool mvd_reset(Player *p) {
 	                            (u32)vw_al, (u32)vh_al, NULL,
 	                            (u32 *)p->mvd_raw[0], (u32 *)p->mvd_raw[1]);
 	p->mvd_need_hdr = true;   /* 重开之后第一帧同样要带上 SPS/PPS */
+	p->mvd_wait_key = true;   /* 重开 = 一次冲刷,同样要从关键帧起步 */
 	p->mvd_first = true;
 	p->mvd_skip = false;
 	p->pts_head = p->pts_len = 0;
@@ -1228,6 +1317,23 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 	u32 osz = (u32)W * (u32)H * 2;
 	int ret = 0;
 	bool got = false;
+
+	/* 【冲刷之后必须等到关键帧才能开送】
+	 * 这是硬解独有的一条规矩,也是"跳转后画面发糊、一块一块慢慢补回来"的
+	 * 真正原因:av_seek_frame 不保证第一个吐出来的包就是关键帧(索引精度、
+	 * 边界帧、B 帧重排都会让它先给出几个非关键帧)。
+	 * ffmpeg 的软解自己挡了这一层 —— avcodec_flush_buffers 之后它会一直
+	 * 丢帧直到见到 IDR/恢复点,所以软解看不出问题。MVD 没有这层保护:
+	 * 喂它一个 P 帧,它就拿着空的参考帧照解,误差随后逐帧累积,
+	 * 要等下一个 IDR 才自己好。
+	 * 两个解码器吃同一串包却只有一个出问题,差别就在这儿。 */
+	if (p->mvd_wait_key) {
+		/* 回 MVD_CONSUMED 而不是 0:0 会让调用方以为"没吃下"而把包塞回
+		 * 队列重试 8 次 —— 这些包我们是**故意**不要的,重试纯属空转。 */
+		if (!(pkt->flags & AV_PKT_FLAG_KEY)) return MVD_CONSUMED;
+		p->mvd_wait_key = false;
+		p->mvd_need_hdr = true;    /* 关键帧前面照例补参数集 */
+	}
 
 	mvd_mark(ob, osz, W);          /* 只刷 4 条角标 cache line */
 	p->mvd_cfg.physaddr_outdata0 = osConvertVirtToPhys(ob);
@@ -1426,6 +1532,13 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 
 /* ---------- 软解 ---------- */
 
+
+/* Y2R(硬件色彩转换)。定义在 sw_decode 那一节 —— 它和软解是一套东西,
+ * 放在一起看得清;这里只声明 */
+static void y2r_setup(Player *p);
+static void y2r_teardown(Player *p);
+static void y2r_drain(Player *p);
+
 static bool sw_start(Player *p) {
 	const AVCodec *c = avcodec_find_decoder(AV_CODEC_ID_H264);
 	if (!c) return false;
@@ -1442,23 +1555,231 @@ static bool sw_start(Player *p) {
 	p->src_w = p->vw;
 	p->src_h = p->vh;
 	p->src_stride = p->tex_w;
+	/* swscale 照建不误 —— 它是 Y2R 的退路。省掉它的话,
+	 * Y2R 在某台机器/某种分辨率上不灵时就直接没画面了。 */
+	y2r_setup(p);
 	return p->sws != NULL;
 }
 
-static bool sw_decode(Player *p, AVPacket *pkt, double *pts_out) {
-	if (avcodec_send_packet(p->vdec, pkt) < 0) return false;
-	if (avcodec_receive_frame(p->vdec, p->vframe) != 0) return false;
-	uint8_t *dst[1] = { (uint8_t *)p->vout[p->back] };
-	int stride[1] = { p->tex_w * 2 };
-	sws_scale(p->sws, (const uint8_t * const *)p->vframe->data, p->vframe->linesize,
-	          0, p->vh, dst, stride);
-	/* 缓存刷新也在 worker 做,主线程只管传输(与硬解路径对齐) */
-	GSPGPU_FlushDataCache(dst[0], (u32)(p->tex_w * 2 * p->vh));
-	int64_t ts = p->vframe->best_effort_timestamp;
-	if (ts == AV_NOPTS_VALUE) ts = p->vframe->pts;
-	*pts_out = (ts == AV_NOPTS_VALUE) ? -1.0 :
-	           ts * av_q2d(p->fmt->streams[p->vstream]->time_base);
+/* 软解各阶段耗时。老机型上「还能不能更快」这个问题,只有先知道时间
+ * 花在哪儿才谈得上 —— 解码是硬成本(改不动),色彩转换和上传是可以动的。
+ * 用 svcGetSystemTick:它恒为 268MHz,不随主频变,两台机器的数直接可比。 */
+static u64 s_sw_dec_t = 0, s_sw_sws_t = 0;
+static u64 s_mb_wait_t = 0;    /* 「包有货但邮箱占着」的累计空转时间 */
+static int s_sw_frames = 0;
+
+/* Y2R 初始化。失败不是错误 —— 退回 swscale 就是了,只是慢一点。 */
+static void y2r_setup(Player *p) {
+	p->y2r_ok = false;
+	p->y2r_evt = 0;
+	p->y2r_in = NULL;
+	if (p->vw <= 0 || p->vh <= 0) return;
+	/* 【硬件的口径】行宽必须是 8 的倍数、不超过 1024;420 还要求行数是偶数。
+	 * 对不上就别硬塞 —— 送进去多半是花屏而不是报错。 */
+	if ((p->vw & 7) || p->vw > 1024 || (p->vh & 1)) {
+		printf("y2r: %dx%d not aligned, using swscale\n", p->vw, p->vh);
+		return;
+	}
+	if (R_FAILED(y2rInit())) { printf("y2r: init failed\n"); return; }
+	p->y2r_sz = (size_t)p->vw * p->vh * 3 / 2;
+	p->y2r_in = (u8 *)linearAlloc(p->y2r_sz);
+	p->y2r_out_sz = (size_t)p->vw * p->vh * 2;
+	p->y2r_out = (u16 *)linearAlloc(p->y2r_out_sz);
+	if (!p->y2r_in || !p->y2r_out) {
+		if (p->y2r_in) { linearFree(p->y2r_in); p->y2r_in = NULL; }
+		if (p->y2r_out) { linearFree(p->y2r_out); p->y2r_out = NULL; }
+		printf("y2r: linear alloc failed\n");
+		y2rExit();
+		return;
+	}
+	/* 这些参数整段播放不变,只设一次;每帧只改收发地址 */
+	bool ok = R_SUCCEEDED(Y2RU_SetInputFormat(INPUT_YUV420_INDIV_8))
+	       && R_SUCCEEDED(Y2RU_SetOutputFormat(OUTPUT_RGB_16_565))
+	       && R_SUCCEEDED(Y2RU_SetRotation(ROTATION_NONE))
+	       && R_SUCCEEDED(Y2RU_SetBlockAlignment(BLOCK_LINE))
+	       && R_SUCCEEDED(Y2RU_SetInputLineWidth((u16)p->vw))
+	       && R_SUCCEEDED(Y2RU_SetInputLines((u16)p->vh))
+	       && R_SUCCEEDED(Y2RU_SetStandardCoefficient(COEFFICIENT_ITU_R_BT_601))
+	       /* 【抖动一定要开】RGB565 的蓝色只有 32 级、绿色 64 级,
+	        * 8bit 的 YUV 降下来必然有台阶。swscale 默认会抖,Y2R 不会 ——
+	        * 不开的话天空、渐变背景上是肉眼可见的色带。
+	        * 而且这两个开关的状态是**跨进程保留**的,不显式设就等于听天由命。
+	        * 硬件做的,不花 CPU。
+	        * 空间抖动:同一帧内用相邻像素打散台阶。
+	        * 时间抖动:相邻帧之间交替,静止画面上效果更好(代价是极轻微的闪) */
+	       && R_SUCCEEDED(Y2RU_SetSpacialDithering(true))
+	       && R_SUCCEEDED(Y2RU_SetTemporalDithering(true))
+	       && R_SUCCEEDED(Y2RU_SetAlpha(0xFFFF))
+	       && R_SUCCEEDED(Y2RU_SetTransferEndInterrupt(true))
+	       && R_SUCCEEDED(Y2RU_GetTransferEndEvent(&p->y2r_evt));
+	if (!ok) {
+		printf("y2r: config failed, using swscale\n");
+		linearFree(p->y2r_in); p->y2r_in = NULL;
+		linearFree(p->y2r_out); p->y2r_out = NULL;
+		y2rExit();
+		return;
+	}
+	p->y2r_ok = true;
+	ui_trace("y2r: 就绪 %dx%d(硬件色彩转换)", p->vw, p->vh);
+}
+
+/* 收掉在途的那一帧并丢弃。seek、切解码器、结束播放都要先调它 ——
+ * 不收的话 DMA 还在往 vout 里写,而那块内存马上要被别人用。 */
+static void y2r_drain(Player *p) {
+	if (!p->y2r_busy) return;
+	if (p->y2r_evt) svcWaitSynchronization(p->y2r_evt, 500000000LL);
+	p->y2r_busy = false;
+}
+
+static void y2r_teardown(Player *p) {
+	y2r_drain(p);
+	if (p->y2r_evt) { svcCloseHandle(p->y2r_evt); p->y2r_evt = 0; }
+	if (p->y2r_in) { linearFree(p->y2r_in); p->y2r_in = NULL; }
+	if (p->y2r_out) { linearFree(p->y2r_out); p->y2r_out = NULL; }
+	if (p->y2r_ok) y2rExit();
+	p->y2r_ok = false;
+}
+
+/* 硬件转换一帧。成功返回 true;任何一步不对就返回 false,
+ * 由调用方退回 swscale —— 并且**永久退回**,不要每帧再试一次:
+ * 失败多半是配置层面的,重试只是每帧白费一次 IPC。 */
+static bool y2r_convert(Player *p, const AVFrame *f, u16 *dst) {
+	const int w = p->vw, h = p->vh;
+	const int cw = w / 2, ch = h / 2;
+	u8 *yp = p->y2r_in;
+	u8 *up = yp + (size_t)w * h;
+	u8 *vp = up + (size_t)cw * ch;
+	/* 按行拷:ffmpeg 的 linesize 通常大于 w(对齐填充),不能整块拷 */
+	for (int i = 0; i < h; i++)
+		memcpy(yp + (size_t)i * w, f->data[0] + (size_t)i * f->linesize[0], (size_t)w);
+	for (int i = 0; i < ch; i++)
+		memcpy(up + (size_t)i * cw, f->data[1] + (size_t)i * f->linesize[1], (size_t)cw);
+	for (int i = 0; i < ch; i++)
+		memcpy(vp + (size_t)i * cw, f->data[2] + (size_t)i * f->linesize[2], (size_t)cw);
+	GSPGPU_FlushDataCache(p->y2r_in, (u32)p->y2r_sz);
+
+	/* 【DMA 目标必须先把脏缓存行刷掉】
+	 * Y2R 是 DMA,直接写物理内存;而 vout 这块内存之前被 CPU 写过
+	 * (swscale 退路、初始化),缓存里可能还留着脏行。那些脏行在 DMA
+	 * 写完之后才被逐出,就会把 DMA 的结果盖掉一片 ——
+	 * ARM11 的缓存行 32 字节 = 16 个像素宽,盖出来正好是竖条,
+	 * 而且每帧脏行位置不同,所以会跳。
+	 * 刷的是整块(含行距填充),不是只刷画面区域:脏行不管我们画哪儿。 */
+	/* DMA 目标先把脏缓存行刷掉:那块内存 CPU 写过,残留的脏行会在
+	 * DMA 写完之后才逐出,把结果盖掉一片 */
+	GSPGPU_FlushDataCache(p->y2r_out, (u32)p->y2r_out_sz);
+
+	svcClearEvent(p->y2r_evt);
+	/* 输出写进 vout,而 vout 的行距是 tex_w(比画面宽)——
+	 * 所以每写完一行要跳过 (tex_w - w) 个像素。gap 就是干这个的。 */
+	bool ok = R_SUCCEEDED(Y2RU_SetSendingY(yp, (u32)(w * h), (s16)w, 0))
+	       && R_SUCCEEDED(Y2RU_SetSendingU(up, (u32)(cw * ch), (s16)cw, 0))
+	       && R_SUCCEEDED(Y2RU_SetSendingV(vp, (u32)(cw * ch), (s16)cw, 0))
+	       /* 紧凑输出:gap 给 0,不依赖那个语义不明的参数 */
+	       && R_SUCCEEDED(Y2RU_SetReceiving(p->y2r_out, (u32)(w * h * 2),
+	                                        (s16)(w * 2), 0))
+	       && R_SUCCEEDED(Y2RU_StartConversion());
+	return ok;   /* 只负责启动;等待交给 y2r_finish */
+}
+
+/* 等在途的那一帧转换完。超时兜底:硬件不回事件时绝不能无限等 ——
+ * 这个工程在无超时的等待上吃过好几次亏(httpc、mvdstdExit)。 */
+static bool y2r_finish(Player *p, u16 *dst) {
+	if (R_FAILED(svcWaitSynchronization(p->y2r_evt, 500000000LL))) {
+		printf("y2r: transfer timeout\n");
+		Y2RU_StopConversion();
+		return false;
+	}
+	/* 紧凑 → 带行距。DMA 刚写完,CPU 这边的缓存里是旧内容,先失效掉,
+	 * 否则拷过去的可能是上一帧 */
+	GSPGPU_InvalidateDataCache(p->y2r_out, (u32)p->y2r_out_sz);
+	const int w = p->vw, h = p->vh;
+	for (int i = 0; i < h; i++)
+		memcpy(dst + (size_t)i * p->tex_w, p->y2r_out + (size_t)i * w,
+		       (size_t)w * 2);
+	GSPGPU_FlushDataCache(dst, (u32)(p->tex_w * h * 2));
 	return true;
+}
+
+static bool sw_decode(Player *p, AVPacket *pkt, double *pts_out) {
+	u64 t0 = svcGetSystemTick();
+	bool decoded = (avcodec_send_packet(p->vdec, pkt) >= 0) &&
+	               (avcodec_receive_frame(p->vdec, p->vframe) == 0);
+	u64 t1 = svcGetSystemTick();
+	s_sw_dec_t += t1 - t0;
+
+	/* ---------- Y2R 流水线 ----------
+	 * 上一帧的 DMA 是在**刚才那段解码**期间跑的,现在回来收它。
+	 * 顺序不能反:先等再解就完全没有重叠,那正是同步版比 swscale 还慢的原因。 */
+	bool publish = false;
+	if (p->y2r_ok) {
+		u64 c0 = svcGetSystemTick();
+		if (p->y2r_busy) {
+			p->y2r_busy = false;
+			if (y2r_finish(p, p->vout[p->y2r_buf])) {
+				*pts_out = p->y2r_pts;
+				p->back = p->y2r_buf;   /* 让调用方发布已经完成的那一面 */
+				publish = true;
+			} else {
+				ui_trace("y2r: 等待失败,永久退回 swscale");
+				y2r_teardown(p);
+			}
+		}
+		if (p->y2r_ok && decoded) {
+			/* 新帧写「不是刚发布的那一面」——发布方随后会把 back 翻过来,
+			 * 正好指向这一面,下一轮再翻回去。两面轮换,谁也不踩谁。 */
+			int target = publish ? (p->y2r_buf ^ 1) : p->back;
+			int64_t ts = p->vframe->best_effort_timestamp;
+			if (ts == AV_NOPTS_VALUE) ts = p->vframe->pts;
+			double tsec = (ts == AV_NOPTS_VALUE) ? -1.0 :
+			              ts * av_q2d(p->fmt->streams[p->vstream]->time_base);
+			if (y2r_convert(p, p->vframe, p->vout[target])) {
+				p->y2r_busy = true;
+				p->y2r_buf = target;
+				p->y2r_pts = tsec;
+			} else {
+				printf("y2r: start failed, falling back to swscale\n");
+				ui_trace("y2r: 启动失败,永久退回 swscale");
+				y2r_teardown(p);
+			}
+		}
+		s_sw_sws_t += svcGetSystemTick() - c0;
+	}
+
+	/* ---------- swscale 退路 ----------
+	 * 同步的:解完当场转,当场发布。Y2R 不可用或中途失败时走这条。 */
+	if (!p->y2r_ok) {
+		if (!decoded) return false;
+		u64 c0 = svcGetSystemTick();
+		uint8_t *dst[1] = { (uint8_t *)p->vout[p->back] };
+		int stride[1] = { p->tex_w * 2 };
+		sws_scale(p->sws, (const uint8_t * const *)p->vframe->data,
+		          p->vframe->linesize, 0, p->vh, dst, stride);
+		s_sw_sws_t += svcGetSystemTick() - c0;
+		GSPGPU_FlushDataCache(dst[0], (u32)(p->tex_w * 2 * p->vh));
+		int64_t ts = p->vframe->best_effort_timestamp;
+		if (ts == AV_NOPTS_VALUE) ts = p->vframe->pts;
+		*pts_out = (ts == AV_NOPTS_VALUE) ? -1.0 :
+		           ts * av_q2d(p->fmt->streams[p->vstream]->time_base);
+		publish = true;
+	}
+
+	if (++s_sw_frames >= 60) {
+		/* 单位:0.1ms。整数运算,别在解码线程上碰浮点格式化 */
+		ui_trace("软解 60 帧均: 解码 %lu.%lums 转换 %lu.%lums 等邮箱 %lu.%lums "
+		         "[%s] (%dx%d→%dx%d)",
+		         (unsigned long)(s_sw_dec_t / 60 / 268112),
+		         (unsigned long)(s_sw_dec_t / 60 / 26811 % 10),
+		         (unsigned long)(s_sw_sws_t / 60 / 268112),
+		         (unsigned long)(s_sw_sws_t / 60 / 26811 % 10),
+		         (unsigned long)(s_mb_wait_t / 60 / 268112),
+		         (unsigned long)(s_mb_wait_t / 60 / 26811 % 10),
+		         p->y2r_ok ? "y2r/流水线" : "sws",
+		         p->vw, p->vh, p->ow, p->oh);
+		s_sw_dec_t = s_sw_sws_t = s_mb_wait_t = 0;
+		s_sw_frames = 0;
+	}
+	return publish;
 }
 
 /* 返回位:bit0=有帧 bit1=包已消费(MVD 可能不消费,需重新投喂) */
@@ -1609,6 +1930,9 @@ static void worker_main(void *arg) {
 				vq_head = 0;
 				if (p->bsf) av_bsf_flush(p->bsf);   /* annex-b 过滤器也要冲刷 */
 				/* 冲刷解码器 */
+				/* 在途的转换要先收掉:它还在往 vout 里写,而马上就要
+				 * 冲刷解码器、这一面的内容随即作废 */
+				y2r_drain(p);
 				if (p->vdec) avcodec_flush_buffers(p->vdec);
 				if (p->adec) avcodec_flush_buffers(p->adec);
 				/* 重采样器内部还压着上一位置的采样,不清的话它们会被拼到
@@ -1637,18 +1961,33 @@ static void worker_main(void *arg) {
 					       (int)(p->clock_ms / 1000));
 				}
 
-				/* 【重开 MVD 要节流】连续拖进度条时,每次 seek 都
-				 * Exit+Init 会把 mvd 系统模块搞崩(整机重启才能恢复)。
-				 * 距上次重开不足 400ms 就跳过 —— 不重开的代价只是
-				 * 解码器里可能残留旧帧,而那些帧会被 seek_gen 判定为
-				 * 上一代、根本不会上屏,完全可以接受。 */
+				/* 【重开 MVD 要节流,但不能跳过】连续拖进度条时,每次
+				 * seek 都 Exit+Init 会把 mvd 系统模块搞崩(整机重启才能
+				 * 恢复),所以两次重开之间至少隔 400ms。
+				 *
+				 * 【原来这里是"跳过重开",那是错的】当时的理由是"残留的
+				 * 旧帧会被 seek_gen 判定为上一代、不会上屏"—— 只想到了
+				 * 残留的**输出**,没想到残留的**参考帧**。MVD 的 DPB 里
+				 * 还压着 seek 之前的画面,不重开也就不会重喂 SPS/PPS,
+				 * 之后的 P 帧参考到的是错的图 —— 屏幕上就是「静止的地方
+				 * 正常、动的地方拖影发糊」,要等下一个 IDR 才自己好。
+				 * 而它只在「距上次重开不足 400ms」时发生,也就是**连续拖
+				 * 进度条**的时候,正是用户报的那个场景。
+				 *
+				 * 改成把那 400ms 等满再重开:节流的保护还在,代价是快速
+				 * 连拖时多等几百毫秒 —— 而 seek 后本来就要重连+重新缓冲,
+				 * 这点时间根本看不出来。带着错的参考帧继续解才是看得出来的。 */
 				if (p->use_mvd) {
-					if (osGetTime() - s_mvd_reset_at < 400) {
-						printf("seek: mvd reset throttled\n");
-						p->mvd_skip = false;
-						p->pts_head = p->pts_len = 0;
-						p->pts_drift = 0;
-					} else if (!mvd_reset(p)) {
+					u64 since = osGetTime() - s_mvd_reset_at;
+					if (since < 400) {
+						u64 wait = 400 - since;
+						printf("seek: mvd reset throttled, waiting %dms\n",
+						       (int)wait);
+						for (u64 slept = 0; slept < wait && !p->quit;
+						     slept += 50)
+							svcSleepThread(50 * 1000 * 1000LL);
+					}
+					if (!p->quit && !mvd_reset(p)) {
 						p->ret = -99;   /* MVD 起不来了:整体降级软解 */
 						break;
 					}
@@ -1681,6 +2020,14 @@ static void worker_main(void *arg) {
 				 * 回跳一下再追回来。改为:关键帧→目标之间照常解码(维持
 				 * 参考链)但音视频全部丢弃,时钟钉在目标位置,和官方 App
 				 * 的精确跳转一致 */
+				/* 【跳转后必须把追赶模式复位】seek_skip 期间是故意快进解码,
+				 * 那段时间的 lag 不代表机器跟不上。不复位的话,跳转本身
+				 * 就会把丢帧模式点着,带进正常播放里 */
+				if (p->vdec) {
+					p->vdec->skip_frame = AVDISCARD_DEFAULT;
+					p->vdec->skip_loop_filter = AVDISCARD_NONREF;
+				}
+				p->mvd_wait_key = true;   /* 硬解:等关键帧再开送,见 mvd_decode_packet */
 				p->seek_skip = tgt;
 				p->start_ms = osGetTime() - (u64)(tgt * 1000.0);
 				p->mb_full = 0;
@@ -1724,6 +2071,24 @@ static void worker_main(void *arg) {
 			    !eof && !p->ring.eof) {
 				p->buffering = 1;
 				printf("buffering...\n");
+				/* 【「缓冲中」有两种完全不同的成因,得分开】
+				 * 这个判据看的是**音频缓冲见底**,而音频饿死可能是:
+				 *   环形缓冲空  → 网络供不上,该优化取流
+				 *   环形缓冲满  → CPU 供不上,worker 忙于解视频、
+				 *                 来不及喂音频,该优化解码
+				 * 两者的修法南辕北辙,而屏幕上都写着「缓冲中」。
+				 * 老机型反馈「不特别卡但老缓冲」正是分不清的那种情况。
+				 * 前 8 次落盘就够定性,之后每 32 次记一条看趋势。 */
+				static u32 buf_n = 0;
+				buf_n++;
+				if (buf_n <= 8 || (buf_n & 31) == 0)
+					ui_trace("缓冲#%lu: 环形=%luKB/%dKB vq=%d 时钟=%lums %s",
+					         (unsigned long)buf_n,
+					         (unsigned long)(ring_used / 1024),
+					         RING_CAP / 1024, vq_len,
+					         (unsigned long)p->clock_ms,
+					         ring_used < 128 * 1024 ? "→网络供不上"
+					                                : "→CPU供不上");
 			} else if (p->buffering &&
 			           /* 起播时还要等弹幕就绪,否则开头几秒的弹幕会被跳过。
 			            * 反正开头本来就要缓冲,两件事并行,不额外增加等待 */
@@ -1774,15 +2139,29 @@ static void worker_main(void *arg) {
 		}
 
 		bool did = false;
+		u64 s_loop_t0 = svcGetSystemTick();
 
 		/* 读包:音频缺粮 或 视频队列未半满 */
 		p->dbg_vq = vq_len;
+		/* 【音频告急时连读】一次循环只读一个包,而包是音视频交错的 ——
+		 * 音频快见底时,单包的补充节奏跟不上消耗,中间还夹着 33ms 的
+		 * 视频解码,于是眼睁睁掉进「缓冲中」。实测老 3DS 上正是这个形状:
+		 * 环形缓冲和包队列都是满的(数据早就到了),偏偏音频饿死。
+		 *
+		 * 告急时就连读几个,把音频喂上再说 —— 视频晚一帧无所谓,
+		 * 掉一帧看不出来,声音断一下立刻就听出来。
+		 * 上限 8 个包:再多就轮不到解码,画面反而先停了。 */
+		int read_burst = 0;
+		do {
 		/* 音频没空间时一律不读:读到的若是音频包就会被丢弃(见 audio_feed)。
-		 * 原条件里 "vq_len < VQ_CAP/2" 这一支会绕过音频空间检查 */
+		 * 原条件里 "vq_len < VQ_CAP/2" 这一支会绕过音频空间检查。
+		 * 放在循环**内**:连读时每一轮都要重新判断,拿上一轮的旧值
+		 * 会在音频喂饱之后继续空读 */
 		bool want_read = !eof && audio_has_room(p) &&
 		    ((p->audio_ok && audio_free_bufs(p) > AUDIO_NBUFS / 4) ||
 		     vq_len < VQ_CAP / 2);
-		if (want_read) {
+		if (!want_read) break;
+		{
 			int r = av_read_frame(p->fmt, pkt);
 			did = true;
 			if (r < 0) {
@@ -1831,6 +2210,16 @@ static void worker_main(void *arg) {
 				av_packet_unref(pkt);
 			}
 		}
+		} while (p->audio_ok && !eof && ++read_burst < 8 &&
+		         audio_has_room(p) &&
+		         audio_free_bufs(p) >= AUDIO_NBUFS - 3);
+
+		/* 【量一下「有货却动不了」】worker 每帧的墙钟时间(~47ms)明显大于
+		 * 解码+转换(~29ms),差的那 18ms 去哪了是个悬案。最大的嫌疑是
+		 * 这一句:包队列里有货,但邮箱还没被主线程取走,worker 只能空转。
+		 * 真是它的话,加一级邮箱深度就能把这段时间变成解码时间;
+		 * 不是它的话,再加缓冲纯属白费内存 —— 先测,别猜。 */
+		if (p->mb_full && vq_len > 0) s_mb_wait_t += svcGetSystemTick() - s_loop_t0;
 
 		/* 邮箱空则解下一帧 */
 		if (!p->mb_full && vq_len > 0) {
@@ -1859,6 +2248,7 @@ static void worker_main(void *arg) {
 					p->hw_trial = 0;
 					p->mvd_trial_noblit = 0;
 					if (p->sws) { sws_freeContext(p->sws); p->sws = NULL; }
+					y2r_teardown(p);
 					if (p->vdec) avcodec_free_context(&p->vdec);
 					p->use_mvd = true;
 					p->sw_since = 0;
@@ -1976,18 +2366,27 @@ static void worker_main(void *arg) {
 				p->dbg_decoded++;
 				need_frame = false;   /* 暂停中 seek 要的那一帧有了 */
 				/* 自适应追赶:落后超过上限才跳非参考帧,追回下限恢复完整解码。
-				 * 同步优先:150/50ms;流畅优先:400/150ms(播放中按 X 切换) */
+				 * 同步优先:150/50ms;流畅优先:400/150ms(播放中按 X 切换)
+				 *
+				 * 【skip_loop_filter 不能给 AVDISCARD_ALL】原来落后时这么
+				 * 干过,理由是省 CPU。可 H.264 的去块滤波是**重建的一部分**:
+				 * 滤过的图才是进 DPB 当参考的那张。对参考帧关掉它,之后每一个
+				 * P 帧都在一张带块效应的图上做预测,误差逐帧累积(drift)。
+				 * 屏幕上看到的就是「动的地方发糊、一块一块地慢慢补回来」——
+				 * 而且专挑 seek 之后出现:那时 clock 已经跳到目标、解码器还在
+				 * 从关键帧啃过来,lag 天然很大,这个模式必被点着。
+				 * NONREF 是安全的(非参考帧的滤波只影响它自己怎么显示),
+				 * 所以上限就卡在 NONREF,不再往上抬。 */
 				if (!p->use_mvd && p->vdec) {
 					s32 hi = p->sync_mode ? 150 : 400;
 					s32 lo = p->sync_mode ? 50 : 150;
 					s32 lag = (s32)p->clock_ms - (s32)p->mb_pts_ms;
 					if (lag > hi) {
 						p->vdec->skip_frame = AVDISCARD_NONREF;
-						p->vdec->skip_loop_filter = AVDISCARD_ALL;
 					} else if (lag < lo) {
 						p->vdec->skip_frame = AVDISCARD_DEFAULT;
-						p->vdec->skip_loop_filter = AVDISCARD_NONREF;
 					}
+					p->vdec->skip_loop_filter = AVDISCARD_NONREF;
 				}
 			}
 			if (vp) av_packet_free(&vp);
@@ -2032,6 +2431,7 @@ static void player_cleanup(Player *p) {
 	if (p->tex_ok) { C3D_TexDelete(&p->tex); p->tex_ok = false; }
 	mvd_stop(p);
 	if (p->sws) sws_freeContext(p->sws);
+	y2r_teardown(p);
 	if (p->vdec) avcodec_free_context(&p->vdec);
 	if (p->adec) avcodec_free_context(&p->adec);
 	if (p->bsf) av_bsf_free(&p->bsf);
@@ -2070,6 +2470,83 @@ int player_play(const char *url, const char *title) {
 	return player_play_inner(url, title);
 }
 
+
+/* ---------- 开流阶段的「别冻住界面」 ----------
+ * ns_open(一次 HTTPS 请求)和 avformat_open_input / find_stream_info
+ * (要从环形缓冲读够数据才返回)都在主线程上,实测各要几秒、偶尔几十秒。
+ * 那期间一帧不画、按键也不扫 —— 用户按 B 没人看见,等它结束播放照常开始,
+ * 于是「取消了却还是播了」。
+ *
+ * 把这一步挪到临时线程,主线程原地画帧并接受 B:
+ * 置 p->quit 之后,avio_read_cb 和 ns_read 都会带着错误立刻返回。 */
+typedef struct { Player *p; int (*fn)(Player *); volatile int done; int ret; } OpenJob;
+
+/* 见 player.h:开流期间由调用方来画帧,保持在原来那一屏 */
+static void (*s_busy_cb)(const char *) = NULL;
+void player_set_busy_cb(void (*cb)(const char *msg)) { s_busy_cb = cb; }
+
+static void open_job_thread(void *arg) {
+	OpenJob *j = (OpenJob *)arg;
+	j->ret = j->fn(j->p);
+	__dmb();
+	j->done = 1;
+}
+
+/* stack:见调用处。**这个参数是这段代码里最容易出人命的地方** ——
+ * avformat_find_stream_info 会真的把解码器开起来解几帧来确定参数,
+ * 栈开销和 worker 同一个量级。原来沿用 32KB,结果是「载入视频」之后
+ * 必崩:栈越界写进相邻的堆,再取出来的指针是一串代码字节
+ * (崩溃现场 R4=E5D17005,正好是一条 ARM 指令的编码)。
+ * 在主线程上跑时没事,只是因为主线程的栈本来就大。 */
+static int run_open(Player *p, int (*fn)(Player *), const char *msg,
+                    size_t stack) {
+	OpenJob job = { p, fn, 0, -1 };
+	Thread th = NULL;
+	static const int cores[] = { 2, 3, -2 };
+	for (int i = 0; i < 3 && !th; i++)
+		th = threadCreate(open_job_thread, &job, stack, 0x31, cores[i], false);
+	if (!th) return fn(p);          /* 建不出来只能同步做 */
+	static const char *dots[4] = { "", ".", "..", "..." };
+	bool cancelling = false;
+	while (!job.done && aptMainLoop()) {
+		hidScanInput();
+		if (!cancelling && (hidKeysDown() & KEY_B)) {
+			cancelling = true;
+			p->quit = 1;              /* 读回调看到它就返回错误 */
+			p->ring.quit = 1;
+			net_cancel_streams();     /* 掐掉在途的那次请求 */
+		}
+		/* 不换成「正在取消」:掐掉连接后阻塞调用很快就带错误返回了,
+		 * 为这一瞬间换一句话,看着反倒像又开始干别的活。只收起 B 的提示 */
+		char m[96];
+		snprintf(m, sizeof(m), "%s%s%s", msg, dots[(osGetTime() / 300) % 4],
+		         cancelling ? "" : "   (B 取消)");
+		if (s_busy_cb) {
+			/* 沿用调用方原来那一屏(列表页),只把状态写进状态条 ——
+			 * 这一步还没有画面可显示,专门开一屏只是让人以为已经切走了 */
+			s_busy_cb(m);
+		} else {
+			float tw = ui_text_width(m, UI_SHARP);
+			ui_begin();
+			ui_text(200.0f - tw / 2.0f, 112, UI_SHARP, UI_COL_TEXT, m);
+			ui_end();
+		}
+		if (net_is_shutting_down() || aptShouldClose()) { p->quit = 1; p->ring.quit = 1; }
+	}
+	thread_reap(&th, 15000000000ULL, "open");
+	return job.done ? job.ret : -1;
+}
+
+static int demux_open_job(Player *p) {
+	if (avformat_open_input(&p->fmt, NULL, NULL, NULL) < 0) return -1;
+	if (avformat_find_stream_info(p->fmt, NULL) < 0) return -2;
+	return 0;
+}
+
+/* 开流/解封装这两步都会长时间阻塞,统一走 run_open(定义在上面)。s_open_url 只是给 job 传参用 —— 同一时刻只有一路开流。 */
+static const char *s_open_url;
+static int ns_open_job(Player *p) { return ns_open(&p->ns, s_open_url, 0); }
+
 static int player_play_inner(const char *url, const char *title) {
 	Player *p = &s_player;
 	memset(p, 0, sizeof(*p));
@@ -2083,10 +2560,20 @@ static int player_play_inner(const char *url, const char *title) {
 	ui_log_ascii(">> ", title ? title : url, 60);  /* 中文标题会变 '?',正常 */
 	printf("connecting...\n");
 	osSetSpeedupEnable(true);
+	/* 【时限决定 core1 能不能用】这是官方允许应用借用系统核的开关。
+	 * New3DS 有 core2/3 富余核,worker 落在那儿,30% 足够。
+	 * 老 3DS 只有 core0 —— 解码、上传、合成、等 VBlank 全挤在一起,
+	 * 实测 360P 一帧解码就吃掉 33ms,而 30fps 的预算正好 33ms。
+	 * 所以老机型多要一些,好把 worker 挪到 core1 去(见下面建线程处)。
+	 * 不要贪到 100:HOME 菜单、apt、无线都在 core1 上,饿着它们的后果
+	 * 是「按 HOME 半天没反应」——那比掉几帧难受得多。 */
 	APT_SetAppCpuTimeLimit(30);
 
-	if (ns_open(&p->ns, url, 0) != 0) {
-		printf("stream open failed\n");
+	/* 开流也是一次同步 HTTPS,实测几秒起步 —— 同样别把界面冻住 */
+	s_open_url = url;
+	/* ns_open 只做 HTTP:重定向每层约 2KB 栈,32KB 够用 */
+	if (run_open(p, ns_open_job, "连接中", 32 * 1024) != 0) {
+		printf("stream open failed (or cancelled)\n");
 		return -1;
 	}
 
@@ -2104,11 +2591,30 @@ static int player_play_inner(const char *url, const char *title) {
 		 * 高优先级下载线程放上去会把 OS 饿着 —— 实测现象是按 HOME
 		 * 进出都很慢,3dsx 和 CIA 都一样。核心 2/3 是 New3DS 的富余核,
 		 * -2 兜底落回应用核 0。 */
+		/* 【为什么要重试】建不出来常常只是一时的:上一页的封面线程可能
+		 * 卡在慢连接上,thumb_stop 等了 8 秒就 threadDetach 放手 ——
+		 * 那条线程还活着,槽位和 96KB 栈都还占着,过一会儿才真的收工。
+		 * 弹幕线程此刻也在下载。一次失败就报错的话,表现正是用户看到的
+		 * 「有的视频按 A 打不开,换个视频又好了」。等一等再试便宜得多。 */
 		static const int dl_cores[] = { 2, 3, -2 };
-		for (int i = 0; i < 3 && !dl_th; i++)
-			dl_th = threadCreate(downloader_main, p, DL_STACK, 0x2E, dl_cores[i], false);
+		for (int attempt = 0; attempt < 4 && !dl_th; attempt++) {
+			for (int i = 0; i < 3 && !dl_th; i++)
+				dl_th = threadCreate(downloader_main, p, DL_STACK, 0x2E,
+				                     dl_cores[i], false);
+			if (!dl_th) svcSleepThread(150000000LL);   /* 150ms */
+		}
 	}
-	if (!dl_th) { printf("downloader thread failed\n"); goto done; }
+	if (!dl_th) {
+		/* threadCreate 只回一个 NULL,堆不够和槽位满看起来一模一样 ——
+		 * 而这两者的修法完全不同。分不清就只能猜,所以先各探一下再报。 */
+		void *probe = malloc(DL_STACK);
+		printf("downloader thread failed (heap %s, linear %luKB)\n",
+		       probe ? "ok" : "FULL",
+		       (unsigned long)(linearSpaceFree() / 1024));
+		free(probe);
+		ui_trace("dl thread fail heap=%s", probe ? "ok" : "full");
+		goto done;
+	}
 	ui_trace("downloader thread up");
 
 	printf("linear free before demux: %luKB\n",
@@ -2131,12 +2637,12 @@ static int player_play_inner(const char *url, const char *title) {
 	s_io_seeks = 0;
 	s_io_seek_ms = 0;
 	u64 t_open = osGetTime();
-	if (avformat_open_input(&p->fmt, NULL, NULL, NULL) < 0) {
-		printf("demux open failed\n");
+	/* find_stream_info 要开解码器解几帧,栈按 worker 的量级给 */
+	if (run_open(p, demux_open_job, "载入视频", WORKER_STACK) != 0) {
+		printf("demux open failed (or cancelled)\n");
 		goto done;
 	}
 	u64 t_info = osGetTime();
-	if (avformat_find_stream_info(p->fmt, NULL) < 0) goto done;
 	ui_trace("demux ready");
 	/* 长片起播慢时先看这两个数:open 慢 = moov 索引大(时长越长越大),
 	 * find_stream_info 慢 = 探测读得太多 */
@@ -2290,7 +2796,20 @@ static int player_play_inner(const char *url, const char *title) {
 		Thread th = NULL;
 		/* 同上:最后一档 -2 是保命的(见 dl_cores 的说明)。
 		 * 这条是解码工作线程,建不出来就等于不能播 */
-		static const int cores[] = { 2, 3, -2 };   /* 核心 1 是系统核,别碰 */
+		/* New3DS:core2/3 是富余核,首选。
+		 * 老 3DS:没有 2/3,原来回落到 -2(默认核 = core0),于是解码和
+		 * 主线程(上传、合成、等 VBlank)抢同一个核 —— 实测这正是
+		 * 「声音流畅、画面像 PPT」的成因:解码本身 33ms 不算离谱,
+		 * 但它和呈现串在一条核上,两边都跑不满。
+		 * 【别再把老机型的 worker 放 core1 —— 试过,更慢】
+		 * 想法是「core0 上解码和主线程互抢,给 worker 一个独立核」。
+		 * 实测反了:core1 是**系统核**,apt、无线、文件系统都在上面,
+		 * 借到的时限是和它们抢、而且系统优先。
+		 * 干净的证据是「转换」那一栏 —— 它主要是固定的 memcpy 加 DMA 等待,
+		 * 几乎不受片源影响,却从 3.0ms 涨到 11ms,说明线程本身在被反复抢占。
+		 * 出帧从 ~21fps 掉到 ~8fps。
+		 * 结论:老机型上 worker 老老实实回落 core0,和主线程分时反而更快。 */
+		const int cores[] = { 2, 3, -2 };
 		for (int i = 0; i < 3 && !th; i++) {
 			th = threadCreate(worker_main, p, WORKER_STACK, 0x2F, cores[i], false);
 			if (th) ui_trace("worker on core %d", cores[i]);
@@ -2306,6 +2825,18 @@ static int player_play_inner(const char *url, const char *title) {
 		s32 late_at_start = 0;     /* 本轮开丢时的落后量,用来判断有没有效 */
 		int catchup_miss = 0;      /* 连续几轮追帧无效 */
 		bool catchup_ok = true;    /* 追帧总开关(无效就自己关掉) */
+		/* 【结构性落后时改成均匀降级】
+		 * 追帧关掉之后,画面会一直落在音频后面 —— 而落后就丢、丢完就放,
+		 * 表现是「成串地丢、成串地放」,观感是 PPT。
+		 * 但人眼对**节奏**远比对帧率敏感:同样是 15fps,均匀的看着比
+		 * 忽快忽慢的 22fps 顺得多。所以认输之后不再追,改成隔一帧丢一帧,
+		 * 把不均匀的丢弃换成稳定的半速。 */
+		bool paced_half = false;   /* 进入均匀半速模式 */
+		bool paced_skip = false;   /* 本帧该不该丢(逐帧交替) */
+		/* 【半速要能退出来】原来只进不出:一段难解的画面把它触发之后,
+		 * 剩下整个视频都留在半速里,哪怕后面轻松得很。
+		 * 连续这么多帧都跟得很紧,就认为难关过去了。 */
+		int paced_good = 0;
 		u64 last_present = 0;      /* 上次真正上屏的时刻(卡顿探针) */
 		u64 stall_quiet = 0;       /* 卡顿日志节流 */
 		/* 弹幕平滑时钟:worker 每轮才发布一次 clock_ms,起播时它忙于
@@ -2444,7 +2975,28 @@ static int player_play_inner(const char *url, const char *title) {
 					 * 「视频偶尔卡一下、音频不卡」。所以必须能自己认输:
 					 * 连续三轮丢完都没见好转,就永久关掉追帧,老老实实按序放。 */
 					s32 late = (s32)(c - fpts);
-					if (late > 400 && have_pic && catchup_ok && late_drop < 2) {
+					/* 均匀半速:认输之后走这条,和上面的成串追帧互斥 */
+					if (paced_half && late > 200 && have_pic) {
+						paced_skip = !paced_skip;
+						paced_good = 0;
+					} else {
+						paced_skip = false;
+						/* 跟得紧就攒信用,攒够就退出半速。
+						 * 90 帧(约 3 秒)足够区分「真的轻松了」和
+						 * 「刚好这两帧简单」—— 阈值太低会来回横跳,
+						 * 那比一直半速更难看。 */
+						if (paced_half && late < 120 && ++paced_good >= 90) {
+							paced_half = false;
+							paced_good = 0;
+							catchup_ok = true;    /* 追帧也一并复活 */
+							catchup_miss = 0;
+							printf("pacing recovered, back to full rate\n");
+							ui_trace("跟上了,退出均匀半速");
+						}
+					}
+					if (paced_skip) {
+						/* 这一帧按节奏丢掉,不上屏也不计入追帧统计 */
+					} else if (late > 400 && have_pic && catchup_ok && late_drop < 2) {
 						if (late_drop == 0) late_at_start = late;
 						late_drop++;
 					} else {
@@ -2453,8 +3005,12 @@ static int player_play_inner(const char *url, const char *title) {
 							if (late >= late_at_start - 50) {
 								if (++catchup_miss >= 3) {
 									catchup_ok = false;
-									printf("catch-up not working (%dms), off\n",
+									paced_half = true;
+									printf("catch-up not working (%dms), "
+									       "switching to even half-rate\n",
 									       (int)late);
+									ui_trace("追帧无效(落后%dms),改为均匀半速",
+									         (int)late);
 								}
 							} else {
 								catchup_miss = 0;
@@ -2768,132 +3324,93 @@ static int player_play_inner(const char *url, const char *title) {
 				                 tp.px, tp.py))
 					in_comments = false;
 			} else if (in_psettings && !ui_console_active()) { /* 播放设置子页 */
-				/* 四行两列。行距 42(按钮 38 + 缝 4):比原来的三行 40+8
-				 * 少占 6px,正好腾出第四行,底下还留得住两行说明。
-				 * 【别再往里加按钮了】再加就得上翻页,而翻页在一个
-				 * 「看片时顺手点一下」的面板上是纯负担。 */
-				#define PS_Y(row) (26.0f + (row) * 42.0f)
-				#define PS_H 38.0f
-				ui_begin_bottom();
-				ui_text(10, 4, UI_SHARP, UI_COL_TEXT, "播放设置");
-				if (ui_button(10, PS_Y(0), 145, PS_H,
-				              s_pref_3d ? "3D:开" : "3D:关",
-				              s_pref_3d ? UI_COL_ACCENT : UI_COL_SEL,
-				              btn_touch, tp.px, tp.py)) {
+				/* 和主设置页共用同一套列表控件:加一项只是往数组里加一行,
+				 * 不用重排布局。原来是四行两列的按钮网格,已经塞满 8 个。 */
+				enum { PS_3D, PS_SUB, PS_DMSZ, PS_SUBSZ, PS_ASPECT,
+				       PS_AREA, PS_SYNC, PS_DEBUG, PS_BACK, PS_N };
+				static const char *sz3[3]  = { "小", "中", "大" };
+				static const char *area4[4] = { "全屏", "1/2", "1/4", "1/8" };
+				char sub_state[64];
+				if (!s_pref_sub)                snprintf(sub_state, sizeof sub_state, "关");
+				else if (sub_count() > 0)       snprintf(sub_state, sizeof sub_state,
+				                                         "开 · %d 行", sub_count());
+				else if (!bili_logged_in())     snprintf(sub_state, sizeof sub_state, "开 · 需登录");
+				else                            snprintf(sub_state, sizeof sub_state, "开 · 本片无轨");
+				UiRow rows[PS_N];
+				rows[PS_3D]     = (UiRow){ "裸眼 3D", s_pref_3d ? "开" : "关",
+					"把左右分屏(SBS)片源变成\n立体画面,弹幕浮在前方,\n"
+					"深度随机身 3D 滑块。\n\n普通 2D 片开了只会花屏 ——\n它需要专门的片源。" };
+				rows[PS_SUB]    = (UiRow){ "CC 字幕", sub_state,
+					"中文字幕轨,人工优先、\nAI 兜底。需要登录。\n"
+					"很多视频根本没有字幕轨,\n那时显示「本片无轨」。" };
+				rows[PS_DMSZ]   = (UiRow){ "弹幕字号", sz3[s_dm_size],
+					"弹幕文字的大小。\n中档最清晰 —— 它正好是\n"
+					"字体的点对点尺寸;\n小和大是拿清晰度换大小。" };
+				rows[PS_SUBSZ]  = (UiRow){ "字幕字号", sz3[s_sub_size], NULL };
+				rows[PS_ASPECT] = (UiRow){ "画面比例", ASPECTS[s_pref_aspect].name,
+					"自动 = 按片源原始比例。\n其余档位是**拉伸**到该比例,\n"
+					"不是裁切 —— 用来去掉上下\n黑边,或把竖屏片撑大。\n改完当场生效,并且记住。" };
+				rows[PS_AREA]   = (UiRow){ "弹幕范围", area4[s_dm_area],
+					"弹幕从上屏顶部往下占多少。\n不想挡脸就往小调。\n"
+					"实际剩几行由「范围 x 字号」\n共同决定。" };
+				rows[PS_SYNC]   = (UiRow){ "软解同步", p->sync_mode ? "同步优先" : "流畅优先",
+					"解码跟不上时,在「画面连贯」\n和「音画对齐」之间取舍。\n\n"
+					"流畅优先:落后 400ms 才跳帧。\n同步优先:落后 150ms 就跳,\n"
+					"嘴型更准但跳得频繁。\n\n硬件解码时两者无差别。" };
+				rows[PS_DEBUG]  = (UiRow){ "调试台", NULL,
+					"全屏日志页。出问题时\n拍下来最有用。\n拖动滚动,双击退出。" };
+				rows[PS_BACK]   = (UiRow){ "返回", NULL, "回到播放控制。\nB 键同样可以。" };
+
+				/* 上屏直接写说明,**不压暗**。
+				 * 原来先铺一层半透明黑,结果说明文字画在它下面(z 更低)
+				 * 反倒被盖住了 —— 屏幕只是暗了一片什么都没有。
+				 * 而且压暗本身也不必要:视频照常播着更知道自己没退出。 */
+				{
+					int f = ui_list_focus();
+					ui_help_draw((f >= 0 && f < PS_N) ? rows[f].name : "播放设置",
+					             (f >= 0 && f < PS_N) ? rows[f].help
+					                                  : "下屏点按修改。\n碰哪一项,这里就说明哪一项。",
+					             NULL, NULL);
+				}
+				int hit = ui_list_draw("播放设置", rows, PS_N, touched,
+				                       (kHeld & KEY_TOUCH) != 0,
+				                       (kUp & KEY_TOUCH) != 0, tp.px, tp.py);
+				switch (hit) {
+				case PS_3D:
 					s_pref_3d = !s_pref_3d;
 					ui_set_3d(s_pref_3d != 0);
-				}
-				if (ui_button(165, PS_Y(0), 145, PS_H,
-				              s_pref_sub ? "字幕:开" : "字幕:关",
-				              s_pref_sub ? UI_COL_ACCENT : UI_COL_SEL,
-				              btn_touch, tp.px, tp.py)) {
+					break;
+				case PS_SUB:
 					s_pref_sub = !s_pref_sub;
 					settings_set("sub", s_pref_sub);
-					/* 开关本身只管画不画,不会产生日志——这里补一行状态,
-					 * 并且"开启但没字幕"时当场重拉一次,方便排查 */
-					printf("subtitle display %s (lines=%d loading=%d)\n",
-					       s_pref_sub ? "ON" : "OFF",
-					       sub_count(), (int)sub_loading());
-					if (s_pref_sub && sub_count() == 0 && !sub_loading()) {
-						if (s_meta_bvid[0] && s_meta_cid) {
-							printf("subtitle reload: bvid=%s cid=%u%09u\n",
-							       s_meta_bvid,
-							       (unsigned)(s_meta_cid / 1000000000),
-							       (unsigned)(s_meta_cid % 1000000000));
-							sub_load_async(s_meta_bvid, s_meta_aid, s_meta_cid);
-						} else {
-							printf("subtitle reload skipped: no bvid/cid\n");
-						}
-					}
+					break;
+				case PS_DMSZ:
+					s_dm_size = (s_dm_size + 1) % 3;
+					settings_set("dm_size", s_dm_size);
+					dm_set_size(s_dm_size);
+					dm_set_area(s_dm_area);   /* 行数依赖字号,重算一次 */
+					break;
+				case PS_SUBSZ:
+					s_sub_size = (s_sub_size + 1) % 3;
+					settings_set("sub_size", s_sub_size);
+					sub_set_size(s_sub_size);
+					break;
+				case PS_ASPECT:
+					s_pref_aspect = (s_pref_aspect + 1) % ASPECT_N;
+					settings_set("aspect", s_pref_aspect);
+					calc_output_size(p);
+					break;
+				case PS_AREA:
+					s_dm_area = (s_dm_area + 1) % 4;
+					settings_set("dm_area", s_dm_area);
+					dm_set_area(s_dm_area);
+					break;
+				case PS_SYNC:  p->sync_mode = !p->sync_mode; break;
+				case PS_DEBUG: want_console = true; break;
+				case PS_BACK:  in_psettings = false; break;
+				default: break;
 				}
-				{
-					static const char *sz[3] = { "弹幕字号:小",
-					                             "弹幕字号:中",
-					                             "弹幕字号:大" };
-					if (ui_button(10, PS_Y(1), 145, PS_H, sz[s_dm_size],
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
-						s_dm_size = (s_dm_size + 1) % 3;
-						settings_set("dm_size", s_dm_size);
-						dm_set_size(s_dm_size);
-						dm_set_area(s_dm_area);   /* 行数依赖字号,重算一次 */
-					}
-				}
-				{	/* 字幕字号(占原"返回"的位置) */
-					static const char *ssz[3] = { "字幕字号:小",
-					                              "字幕字号:中",
-					                              "字幕字号:大" };
-					if (ui_button(165, PS_Y(1), 145, PS_H, ssz[s_sub_size],
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
-						s_sub_size = (s_sub_size + 1) % 3;
-						settings_set("sub_size", s_sub_size);
-						sub_set_size(s_sub_size);
-					}
-				}
-				{	/* 画面比例:循环切换,当场生效(只改绘制时的缩放) */
-					char ab[32];
-					snprintf(ab, sizeof(ab), "画面比例:%s",
-					         ASPECTS[s_pref_aspect].name);
-					/* 【不按值高亮】按钮上写着当前值,高亮不提供任何额外信息,
-					 * 只是让「非默认」看起来像「开启了什么」。同一行里
-					 * 3D 那个是真·开关(开着会影响画面),那种才该高亮。 */
-					if (ui_button(10, PS_Y(2), 145, PS_H, ab,
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
-						s_pref_aspect = (s_pref_aspect + 1) % ASPECT_N;
-						settings_set("aspect", s_pref_aspect);
-						calc_output_size(p);
-					}
-				}
-				{	/* 弹幕范围:从上屏顶部往下占多少 */
-					static const char *ar[4] = { "弹幕范围:全屏",
-					                             "弹幕范围:1/2",
-					                             "弹幕范围:1/4",
-					                             "弹幕范围:1/8" };
-					if (ui_button(165, PS_Y(2), 145, PS_H, ar[s_dm_area],
-					              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
-						s_dm_area = (s_dm_area + 1) % 4;
-						settings_set("dm_area", s_dm_area);
-						dm_set_area(s_dm_area);
-						/* 行数是范围 x 字号一起决定的,光看档位看不出
-						 * 实际剩几行 —— 打出来,免得又靠数屏幕 */
-						printf("danmaku area=%d -> %d rows\n",
-						       s_dm_area, dm_rows());
-					}
-				}
-				if (ui_button(10, PS_Y(3), 145, PS_H, "调试台", UI_COL_SEL,
-				              btn_touch, tp.px, tp.py))
-					want_console = true;
-				/* 右下角:软解才有的同步/流畅;硬解时该位置放"返回" */
-				if (!p->use_mvd) {
-					if (ui_button(165, PS_Y(3), 145, PS_H,
-					              p->sync_mode ? "软解:同步优先" : "软解:流畅优先",
-					              UI_COL_SEL, btn_touch, tp.px, tp.py))
-						p->sync_mode = !p->sync_mode;
-				} else if (ui_button(165, PS_Y(3), 145, PS_H, "返回", UI_COL_SEL,
-				                     btn_touch, tp.px, tp.py)) {
-					in_psettings = false;
-				}
-				{	/* 字幕状态实况:排查"开了却不显示"卡在哪一步 */
-					char sb[72];
-					if (sub_loading())
-						snprintf(sb, sizeof(sb), "字幕:加载中…");
-					else if (sub_count() > 0)
-						snprintf(sb, sizeof(sb), "字幕:%s %d 行",
-						         bili_subtitle_is_ai() ? "AI" : "人工",
-						         sub_count());
-					else if (!bili_logged_in())
-						snprintf(sb, sizeof(sb), "字幕:需登录后才能获取");
-					else
-						snprintf(sb, sizeof(sb), "字幕:本片无中文字幕轨");
-					ui_text(10, PS_Y(4) - 2, UI_SHARP, UI_COL_DIM, sb);
-				}
-				/* 只剩两行说明的位置了(第四行按钮吃掉一行),所以这行
-				 * 得把「3D 要什么片源」和「怎么退出」并成一句。
-				 * 弹幕范围/画面比例不写说明:按钮上就是当前值,点一下
-				 * 上屏当场变,比一行小字管用。 */
-				ui_text(10, PS_Y(4) + 18, UI_SHARP, UI_COL_DIM,
-				        "3D 需左右分屏片源   B 键退出设置");
-				#undef PS_Y
-				#undef PS_H
+
 			} else if (ui_console_active()) {  /* 日志页(自绘) */
 				if (ui_draw_log(touched, (kHeld & KEY_TOUCH) != 0,
 				                tp.px, tp.py))
@@ -3012,6 +3529,9 @@ static int player_play_inner(const char *url, const char *title) {
 					if (ui_button(10, 50, 96, 40, "选集", UI_COL_SEL,
 					              btn_touch, tp.px, tp.py)) {
 						in_pages = true;
+						/* 选集页有自己的滚动状态,但设置页的列表控件是全局的
+						 * —— 先归零,免得两边互相污染 */
+						ui_list_reset();
 						/* 打开时把当前这一 P 大致居中,免得还要自己滑去找 */
 						pg_scroll = (float)s_pg_cur * 34.0f - 68.0f;
 						if (pg_scroll < 0) pg_scroll = 0;
@@ -3028,19 +3548,28 @@ static int player_play_inner(const char *url, const char *title) {
 				if (ui_button(112, 50, 96, 40, p->pause ? "播放" : "暂停",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) do_pause = true;
 				if (ui_button(214, 50, 96, 40, "设置", UI_COL_SEL,
-				              btn_touch, tp.px, tp.py))
+				              btn_touch, tp.px, tp.py)) {
 					in_psettings = true;
+					ui_list_reset();   /* 滚动和高亮归零,别带着上次的状态进来 */
+				}
 				/* 这一行只放得下一条。没声音优先:3D 那条是"可以更好",
 				 * 静音是"东西没按预期工作",后者更需要解释 */
 				if (!p->audio_ok && p->audio_err[0])
 					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT, p->audio_err);
-				else if (s_pref_3d != 0 && s_cur_qn == 16)
+				else if (s_pref_3d != 0 && s_cur_qn < 32)
 					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT,
 					        "3D 建议切 480P 更清晰");
 				if (ui_button(10, 100, 96, 40,
 				              s_pref_danmaku ? "弹幕:开" : "弹幕:关",
-				              UI_COL_SEL, btn_touch, tp.px, tp.py))
+				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 					s_pref_danmaku = !s_pref_danmaku;
+					/* 【播放中改的也要存】原来只有设置页那个开关落盘,
+					 * 这里改完下个视频就被主程序的值覆盖回去 ——
+					 * 用户的感受是「关了又自己开回来」。
+					 * 同一个设置有两个入口时,两个都得落盘,
+					 * 否则「哪次算数」取决于用户从哪儿点的。 */
+					settings_set("danmaku", s_pref_danmaku);
+				}
 				if (ui_button(112, 100, 96, 40, "发弹幕",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py))
 					want_dm_input = true;
@@ -3181,15 +3710,12 @@ static int player_play_inner(const char *url, const char *title) {
 		if (rep_th) {           /* 先收上报线程,它可能正卡在一次 POST 上 */
 			s_rep_quit = 1;
 			__dmb();
-			if (R_FAILED(threadJoin(rep_th,
-			                        net_is_shutting_down() ? JOIN_NS : 8000000000ULL)))
-				printf("reporter join timeout\n");
-			threadFree(rep_th);
+			thread_reap(&rep_th,
+			            net_is_shutting_down() ? JOIN_NS : 8000000000ULL,
+			            "reporter");
 		}
 		ui_trace_sync("exit: join worker");
-		if (R_FAILED(threadJoin(th, JOIN_NS)))
-			printf("worker join timeout\n");
-		threadFree(th);
+		thread_reap(&th, JOIN_NS, "worker");
 		if (ret == -1) ret = p->ret;
 	}
 
@@ -3204,11 +3730,8 @@ done:
 		 * 它随时可能在 close/reopen,直接对它发 IPC 是竞态。 */
 		net_cancel_streams();
 		ui_trace_sync("exit: join downloader");
-		if (R_FAILED(threadJoin(dl_th,
-		                        net_is_shutting_down() ? 500000000ULL
-		                                               : 5000000000ULL)))
-			printf("downloader join timeout\n");
-		threadFree(dl_th);
+		thread_reap(&dl_th, net_is_shutting_down() ? 500000000ULL
+		                                          : 5000000000ULL, "downloader");
 	}
 	ui_trace_sync("exit: comment_free");
 	comment_free();   /* 评论线程可能还在跑,收掉 */
@@ -3237,7 +3760,13 @@ done:
 		bili_report_history(s_meta_aid, s_meta_cid,
 		                    (int)(s_player_clock_ms / 1000));
 	ui_set_3d(false);   /* 离开播放页回到 2D(列表页不需要立体) */
-	ui_trace("playback end ret=%d", ret);
+	/* 【判据:解复用读到了片尾,而且不是被别的意图打断】
+	 * p->quit 由「B 退出」和「点选集换 P」都会置位,所以光看它分不出来;
+	 * 加上 dbg_eof(av_read_frame 返回 <0)才是「真的看完了」。
+	 * 用户中途退出却被自动带到下一集,是最让人恼火的那种「聪明」。 */
+	s_ended_eof = (p->dbg_eof != 0) && (s_page_pick < 0) && (ret == 0);
+	ui_trace("playback end ret=%d eof=%d 自然结束=%d",
+	         ret, p->dbg_eof, (int)s_ended_eof);
 	printf("playback end (%d)\n", ret);
 	return ret;
 }

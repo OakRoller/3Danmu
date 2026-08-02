@@ -185,6 +185,19 @@ static void unescape(const char *src, size_t n, char *out, size_t outlen) {
 			default:  out[o++] = e;   break;
 		}
 	}
+	/* 【截断要落在字符边界上】上面按字节拷,装不下就 break —— 一个汉字
+	 * 三字节,正好卡在中间就留下半个字符,屏幕上是个乱码方块。
+	 * 这里把结尾不完整的那一截退掉。标题、用户名、弹幕全经过这儿。 */
+	while (o > 0 && (out[o - 1] & 0xC0) == 0x80) {
+		/* 往前找到首字节,看这串本该多长 */
+		size_t st = o - 1;
+		while (st > 0 && (out[st] & 0xC0) == 0x80) st--;
+		unsigned char lead = (unsigned char)out[st];
+		size_t need = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 :
+		              (lead >= 0xC0) ? 2 : 1;
+		if (o - st >= need) break;      /* 完整,不动 */
+		o = st;                          /* 半个字符:整个退掉 */
+	}
 	out[o] = 0;
 }
 

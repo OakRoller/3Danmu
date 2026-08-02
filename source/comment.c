@@ -5,17 +5,19 @@
 #include <string.h>
 
 #include "comment.h"
+#include <time.h>
 #include "bili.h"
 #include "net.h"
 #include "ui.h"
 
 #define CM_MAX   20      /* 一页 20 条,和接口 ps 参数一致 */
 /* 单条评论的**行数上限**(不是固定行数)——真实行数按内容折出来,
- * 一条几个字就占一行,长的就占十几行,完整显示不截断。
- * 20 是安全上界:正文最多 512 字节,而一行至少放得下 4~5 个汉字
- * (下屏 296px / 汉字约 19px ≈ 15 字),512B 撑死也到不了 20 行。
- * 上限存在只是为了 brk[] 定长,不是显示策略。 */
-#define CM_LINES 20
+ * 一条几个字就占一行,长的就占几十行,完整显示不截断。
+ * 正文上限 1536 字节,一行放得下约 15 个汉字(下屏 296px / 汉字约 19px),
+ * 即 45 字节左右 → 1536B 最多约 35 行。48 是留了余量的安全上界。
+ * 上限存在只是为了 brk[] 定长,不是显示策略。
+ * 【改这个数要连 wrap 的复杂度一起看】见下面那段说明。 */
+#define CM_LINES 48
 #define CM_W     296.0f  /* 正文可用宽度(下屏 320 减去左右边距和滚动条) */
 /* 字号。系统字体(抗锯齿)的格子约 30px 高,所以 0.5 ≈ 15px 汉字。
  * 和 main.c / player.c 里那些 0.44~0.6 是同一个量纲,改动前先对齐它们。
@@ -44,6 +46,31 @@
  * 反倒是 0.52 的用户名行清清楚楚。清晰和「比别处大」只能选一个。 */
 #define CM_FONT  UI_SHARP  /* 正文 */
 #define CM_META  UI_SHARP  /* 用户名/赞数那一行 */
+
+/* 发布时间。近的用相对时间(和网页端/App 一致,窄栏里也更好读),
+ * 超过 30 天就写日期 —— 那时候"多少天前"已经没人在心里换算了。
+ * 时区:3DS 的 time() 走的是主机本地时钟,localtime 在没设 TZ 时等同于
+ * 直接把它当本地时间用,正好对上。ctime 是 UTC 秒,两边基准差一个时区
+ * 偏移 —— 对"几分钟前"这种量级看不出来,而超过 30 天的一律走日期,
+ * 也就顶多在跨日的那一刻差一天。为这点误差去引一套时区表不值得。 */
+static void fmt_ctime(int64_t t, char *out, size_t n) {
+	if (t <= 0) { out[0] = 0; return; }
+	time_t now = time(NULL);
+	int64_t d = (int64_t)now - t;
+	if (d < 0) d = 0;                    /* 机器时钟慢了,别显示"负几分钟前" */
+	if (d < 60)              snprintf(out, n, "刚刚");
+	else if (d < 3600)       snprintf(out, n, "%d分钟前", (int)(d / 60));
+	else if (d < 86400)      snprintf(out, n, "%d小时前", (int)(d / 3600));
+	else if (d < 30 * 86400) snprintf(out, n, "%d天前", (int)(d / 86400));
+	else {
+		time_t tt = (time_t)t;
+		struct tm tm;
+		if (localtime_r(&tt, &tm))
+			snprintf(out, n, "%04d-%02d-%02d",
+			         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+		else out[0] = 0;
+	}
+}
 #define CM_TIP   UI_SHARP  /* 底部操作提示,和设置页等处同一档 */
 /* 行高**不再硬编码** —— 位图字体的行高由字体和 mkbcfnt 的 -s 决定,
  * 猜一个常数换个字体就叠字(实测踩过)。每帧向字体问一次,
@@ -247,22 +274,32 @@ void comment_free(void) {
 static void wrap(CmItem *it) {
 	if (it->nlines >= 0) return;
 	const char *t = it->c.text;
-	char buf[sizeof(it->c.text)];
 	size_t i = 0;
 	int ln = 0;
 	it->brk[0] = 0;
+	/* 【逐字累加宽度,而不是每加一个字重量一次整行】
+	 * 原来的写法每前进一个字符就把「行首到这里」的整段重新量一遍 ——
+	 * 单行 O(n²)。正文 512 字节时还看不出来(一行十几个字),
+	 * 提到 1536 之后一屏 20 条要量上万次,全压在**加载完的第一帧**里
+	 * (布局要算高度,所有条目都得先折行),那一帧就是肉眼可见的一顿。
+	 *
+	 * 位图字体没有 kerning,整串宽度就是各字形 advance 之和,所以累加
+	 * 和整体测量等价。真有出入也只是某一行早/晚断一个字,不会错行。 */
 	while (t[i] && ln < CM_LINES) {
 		size_t start = i, last_fit = i;
+		float w = 0.0f;
 		while (t[i]) {
 			size_t cl = 1;
 			unsigned char ch = (unsigned char)t[i];
 			if (ch >= 0xF0) cl = 4;
 			else if (ch >= 0xE0) cl = 3;
 			else if (ch >= 0xC0) cl = 2;
-			if (i - start + cl >= sizeof(buf)) break;
-			memcpy(buf, t + start, i - start + cl);
-			buf[i - start + cl] = 0;
-			if (ui_text_width(buf, CM_FONT) > CM_W) break;
+			char one[5];
+			memcpy(one, t + i, cl);
+			one[cl] = 0;
+			float cw = ui_text_width(one, CM_FONT);
+			if (w + cw > CM_W) break;
+			w += cw;
 			i += cl;
 			last_fit = i;
 		}
@@ -358,9 +395,18 @@ bool comment_draw(bool touch_down, bool touch_held, float tx, float ty) {
 			float h = s_lh * ((it->nlines > 0 ? it->nlines : 1) + 1) + 6.0f;
 			/* 只画落在可视区内的,滚动时才不会白算一屏外的字 */
 			if (y + h > s_head_h - s_lh && y < 240.0f) {
-				char meta[72];
+				char meta[72], when[32];
 				snprintf(meta, sizeof(meta), "%s  %d赞", it->c.user, it->c.like);
-				ui_text_clipped_z(8, y, 0.5f, CM_META, UI_COL_ACCENT, meta, CM_W);
+				fmt_ctime(it->c.ctime, when, sizeof(when));
+				/* 时间右对齐,和用户名同色同字号:它是同一行的次要信息,
+				 * 换个颜色只会让这一行看起来有两种东西。
+				 * 左边那截要按剩余宽度裁,否则长用户名会顶到时间上。 */
+				float tw = when[0] ? ui_text_width(when, CM_META) : 0.0f;
+				ui_text_clipped_z(8, y, 0.5f, CM_META, UI_COL_ACCENT, meta,
+				                  CM_W - (tw > 0.0f ? tw + 8.0f : 0.0f));
+				if (when[0])
+					ui_text_z(8 + CM_W - tw, y, 0.5f, CM_META,
+					          UI_COL_ACCENT, when);
 				for (int k = 0; k < it->nlines; k++) {
 					char line[sizeof(it->c.text)];
 					int a = it->brk[k], b = it->brk[k + 1];

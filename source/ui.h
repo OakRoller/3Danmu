@@ -114,6 +114,30 @@ float ui_text_width(const char *utf8, float scale);
  * 换字体或换 mkbcfnt 的 -s 参数,行高就变了,硬编码必然叠字 */
 float ui_text_height(float scale);
 
+/* ---------- 设置列表(下屏)+ 说明(上屏) ----------
+ * 【为什么不用按钮网格】网格的容量是固定的:6 个格子占满,再加一项就得
+ * 重排一次,而设置只会越来越多。列表加一项只是往数组里加一行。
+ * 两个设置页(主设置、播放设置)共用这一套 —— 不然又是两份各自漂移的布局。
+ *
+ * help 需要**预先折好行**(用 \n 分隔)。这里不做自动折行:中文折行要按
+ * 字宽逐字量,而说明文字是写死的,写的时候折一次比每帧算一次划算。 */
+typedef struct {
+	const char *name;    /* 左侧项名 */
+	const char *value;   /* 右侧当前值;NULL = 动作项(画一个 ›) */
+	const char *help;    /* 上屏说明,可为 NULL */
+} UiRow;
+
+void ui_list_reset(void);      /* 进入页面时调一次:清滚动和高亮 */
+/* 画一页设置列表。返回被点中的行下标,-1 = 没点中。
+ * 内部会调 ui_begin_bottom(),调用方不要重复调。 */
+int  ui_list_draw(const char *title, const UiRow *rows, int n,
+                  bool touched, bool holding, bool released,
+                  float tx, float ty);
+int  ui_list_focus(void);      /* 当前高亮的行(给上屏画说明用);-1 = 无 */
+/* 上屏:标题 + 说明正文(已折行)。footer 可为 NULL */
+void ui_help_draw(const char *title, const char *body, const char *footer1,
+                  const char *footer2);
+
 /* 全局字号微调(设置页里的「字号 -/+」)。
  * 换字体后各页面字号是否合适,靠肉眼在真机上定最快 —— 每猜一次就重编译、
  * 重传一次太慢。这里开一个运行时旋钮,调顺眼了把值写回 ui.c 的 UI_FONT_K。
