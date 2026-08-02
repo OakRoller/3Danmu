@@ -25,7 +25,10 @@ const C2D_Image *thumb_get(int idx);                  /* NULL = 未就绪/无图
 void thumb_new_frame(int budget); /* 每帧调一次:本帧允许的 GPU 上传张数 */
 /* 封面缓存(SD 卡):原始 JPEG 存盘,下次同一封面直接读盘。
  * 超过 100MB 自动清空;也可由设置页手动清 */
-void thumb_cache_clear(void);
+void thumb_cache_clear(void);        /* 同步版:只在后台线程里调 */
+void thumb_cache_clear_async(void);  /* 界面上一律用这个 */
+bool thumb_cache_clearing(void);
+int  thumb_cache_clear_pct(void);    /* 清理进度 0~100(界面显示用) */
 u32  thumb_cache_kb(void);      /* 当前缓存占用(KB) */
 
 /* 加载进度:返回是否仍在加载,done 与 total 输出完成数与总数 */

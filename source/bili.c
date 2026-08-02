@@ -520,6 +520,7 @@ int bili_comments(int64_t aid, int page, BiliComment *out, int max, int *count) 
 		int64_t v = 0;
 		if (json_get_int(j, el, "like", &v)) c->like = (int)v;
 		if (json_get_int(j, el, "rcount", &v)) c->replies = (int)v;
+		if (json_get_int(j, el, "ctime", &v)) c->ctime = v;
 		m++;
 	}
 	*count = m;
@@ -1339,6 +1340,33 @@ static bool is_bad_cdn(const char *url) {
 }
 
 /* 从 playurl 响应里取 durl mp4 直链,优先正规 upos CDN */
+/* 【要了什么、给了什么】接口对不认识的 qn 不会报错,而是**给一个它认为
+ * 最接近的档位**。我们只取 durl 的话,这种「要 240P 给 360P」完全静默 ——
+ * 老机型上表现就是「明明选了 240P 却还是卡」,而设置页显示得好好的。
+ * data.quality 是服务端实际给的那一档,accept_quality 是它愿意给的全部。 */
+static void log_quality(Json *j, int want) {
+	int64_t got = -1;
+	json_get_int(j, -1, "data.quality", &got);
+	if (got < 0) json_get_int(j, -1, "quality", &got);
+	if (got < 0) { ui_trace("playurl: 要 qn=%d,响应里没有 quality 字段", want); return; }
+	if ((int)got == want) {
+		ui_trace("playurl: qn=%d 如愿", want);
+		return;
+	}
+	/* 不一致时把可选档位也列出来 —— 直接回答「那这个视频到底有没有 240P」 */
+	char acc[96] = {0};
+	size_t o = 0;
+	for (int i = 0; i < 8 && o + 8 < sizeof(acc); i++) {
+		char path[40];
+		int64_t q = -1;
+		snprintf(path, sizeof(path), "data.accept_quality[%d]", i);
+		if (!json_get_int(j, -1, path, &q) || q < 0) break;
+		o += (size_t)snprintf(acc + o, sizeof(acc) - o, "%s%d", o ? "," : "", (int)q);
+	}
+	ui_trace("playurl: 要 qn=%d,给的是 %d(可选:%s)",
+	         want, (int)got, acc[0] ? acc : "未知");
+}
+
 static bool extract_durl(Json *j, char *url_out, size_t urllen) {
 	char cand[2048];
 	/* 主地址 + 备选地址逐个试,取第一个非 p2p 的 */
@@ -1399,6 +1427,7 @@ int bili_get_play_url(const char *bvid, int64_t cid, int qn, char *url_out, size
 			ui_trace("playurl 一级(wbi): %s %dms %s", j ? "有响应" : "失败",
 			         (int)(osGetTime() - t0), j ? "" : s_last_err);
 			if (j) {
+				log_quality(j, qn);
 				bool ok = extract_durl(j, url_out, urllen);
 				json_free(j);
 				free(body);
@@ -1429,6 +1458,7 @@ int bili_get_play_url(const char *bvid, int64_t cid, int qn, char *url_out, size
 		         (int)(osGetTime() - t0), j ? "" : s_last_err);
 	}
 	if (j) {
+		log_quality(j, qn);
 		bool ok = extract_durl(j, url_out, urllen);
 		json_free(j);
 		free(body);

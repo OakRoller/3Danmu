@@ -19,6 +19,7 @@
 #include <libswscale/swscale.h>
 
 #include "thumb.h"
+#include "thread_util.h"
 #include "net.h"
 #include "settings.h"   /* 缓存文件数存在这里,免得每次开机重扫 */
 #include "ui.h"   /* printf 要经 ui_printf 才进得了调试台环形缓冲 */
@@ -72,6 +73,12 @@ static u64 s_t_start;
 static bool s_t_done;
 
 static void cache_scan_kick(void);   /* 定义在下面的缓存小节里 */
+/* 清缓存的后台线程。声明放这儿:thumb_exit 在下面就要收它,
+ * 而定义在缓存那一节(和 thumb_cache_clear 放一起看得清) */
+static Thread s_clr_th;
+static volatile int s_clearing;
+static volatile int s_clr_done;   /* 已删文件数 */
+static volatile int s_clr_total;  /* 开工前数出来的总数,0 = 还没数完 */
 
 void thumb_init(void) {
 	mkdir("sdmc:/3ds", 0777);
@@ -87,6 +94,8 @@ void thumb_init(void) {
 
 void thumb_exit(void) {
 	thumb_stop();
+	/* 清理线程在做文件系统调用,而 main 返回后运行时会把 fs 拆掉 */
+	thread_reap(&s_clr_th, 5000000000ULL, "thumb clear");
 	/* 缓存扫描线程已删除(见上面那段说明),这里不再需要收它 */
 	for (int i = 0; i < SLOTS; i++) {
 		if (s_stage[i]) { linearFree(s_stage[i]); s_stage[i] = NULL; }
@@ -185,17 +194,100 @@ static void cache_scan_kick(void) {
 	printf("thumb: cache count starts at 0 (see thumb.c)\n");
 }
 
+/* 【清缓存必须离开主线程】
+ * 目录里可能有几万个文件,逐个 remove 的耗时完全不可控。放在主线程上
+ * 就是点一下界面直接冻住 —— 这个错在启动路径上犯过一次(卡在「加载中」),
+ * 这次换成用户点击触发,同样的坑。
+ * 用户主动点的操作可以慢,但不能让界面停止响应。 */
+bool thumb_cache_clearing(void) { return s_clearing != 0; }
+/* 进度百分比。总数未知时回 0 —— 调用方显示 0% 即可,
+ * 那段时间正是在数文件,本来也没什么可报的。 */
+int thumb_cache_clear_pct(void) {
+	int t = s_clr_total, d = s_clr_done;
+	if (t <= 0) return 0;
+	if (d >= t) return 100;
+	return d * 100 / t;
+}
+
+static void clear_thread(void *arg) {
+	(void)arg;
+	thumb_cache_clear();
+	__dmb();
+	s_clearing = 0;
+}
+
+void thumb_cache_clear_async(void) {
+	if (s_clearing) return;
+	thread_reap(&s_clr_th, 2000000000ULL, "thumb clear");
+	s_clr_done = 0;
+	s_clr_total = 0;
+	s_clearing = 1;
+	__dmb();
+	/* 优先级压到最低那一档:它只是在删文件,不该和界面抢 */
+	static const int cores[] = { 3, 2, -2 };
+	for (int i = 0; i < 3 && !s_clr_th; i++)
+		s_clr_th = threadCreate(clear_thread, NULL, 32 * 1024, 0x3B, cores[i], false);
+	if (!s_clr_th) { s_clearing = 0; thumb_cache_clear(); }   /* 建不出来只能同步做 */
+}
+
+/* 【不能边 readdir 边 remove】那是未定义行为,而 3DS 这套 FS 上的实际
+ * 表现是迭代器被打乱:轻则漏删,重则每次 readdir 都回到同一个删不掉的
+ * 条目上 —— 循环再也出不来,界面就永远停在「清理中…」。
+ * 改成分批:开目录读一批名字、关目录、再删。删不动就退出,绝不空转。 */
+/* 16 x 256B = 4KB 的栈开销 —— 清理线程的栈也一并从 16KB 提到 32KB。
+ * (刚在 player.c 的开流线程上栽过一次:把活挪到自建线程,栈大小这个
+ *  前提是会跟着变的,不能沿用原来的数。) */
+#define CLR_BATCH 16
+
 void thumb_cache_clear(void) {
-	DIR *d = opendir(THUMB_CACHE_DIR);
-	if (d) {
+	char names[CLR_BATCH][256];
+	char path[320];       /* 同上:按 d_name 的 255 字节上界给 */
+
+	/* 先数一遍,好把进度报成百分比。
+	 * 【为什么这次数得起】启动路径上坚决不扫盘,是因为那是主线程,
+	 * 几万个文件的遍历会把界面钉死。这里跑在清理线程上,而且紧接着
+	 * 就要把这些文件逐个删掉 —— 删的开销远大于数的开销,多走一遍
+	 * 只读的遍历不改变量级,却让用户知道还要等多久。 */
+	{
+		DIR *d = opendir(THUMB_CACHE_DIR);
+		if (d) {
+			struct dirent *e;
+			int n = 0;
+			while ((e = readdir(d)) != NULL)
+				if (e->d_name[0] != '.') n++;
+			closedir(d);
+			s_clr_total = n;
+			__dmb();
+		}
+	}
+
+	for (;;) {
+		int n = 0;
+		DIR *d = opendir(THUMB_CACHE_DIR);
+		if (!d) break;
 		struct dirent *e;
-		char path[320];       /* 同上:按 d_name 的 255 字节上界给 */
-		while ((e = readdir(d)) != NULL) {
+		while (n < CLR_BATCH && (e = readdir(d)) != NULL) {
 			if (e->d_name[0] == '.') continue;
-			snprintf(path, sizeof(path), THUMB_CACHE_DIR "/%s", e->d_name);
-			remove(path);
+			snprintf(names[n], sizeof(names[n]), "%s", e->d_name);
+			n++;
 		}
 		closedir(d);
+		if (n == 0) break;              /* 空了,收工 */
+		int removed = 0;
+		for (int i = 0; i < n; i++) {
+			/* %.255s 而不是 %s:names[i] 是二维数组的一行,编译器证明不了
+			 * 它在 256 字节内结束(最坏可以一路读到整块 4KB 的末尾),
+			 * 于是报 format-truncation。写死上界既让它闭嘴,也确实更对。 */
+			snprintf(path, sizeof(path), THUMB_CACHE_DIR "/%.255s", names[i]);
+			if (remove(path) == 0) { removed++; s_clr_done++; }
+		}
+		/* 【这一整批一个都没删掉就必须停】否则下一轮 opendir 会原样再读到
+		 * 它们,循环永远出不去。删不掉多半是文件被占着或卡上有坏项 ——
+		 * 那是另一回事,不该表现成界面卡死。 */
+		if (removed == 0) {
+			printf("thumb: clear stalled, %d files undeletable\n", n);
+			break;
+		}
 	}
 	s_cache_bytes = 0;
 	s_cache_files = 0;

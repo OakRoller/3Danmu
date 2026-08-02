@@ -18,6 +18,7 @@
 #include "net.h"
 #include "bili.h"
 #include "player.h"
+#include "thread_util.h"
 #include "danmaku.h"
 #include "ime.h"
 #include "settings.h"
@@ -52,6 +53,13 @@ typedef enum { MODE_POPULAR, MODE_RECOMMEND, MODE_SEARCH,
                MODE_HISTORY, MODE_FAV } ListMode;
 
 static BiliVideo s_list[MAX_LIST];
+/* 【为什么要多一份 10KB 的暂存】接口层一进来就把 *count 清零、再逐条填,
+ * 而那时旧的一页还画在屏幕上。直接写 s_list 的话,翻页途中 s_count 会短暂
+ * 归零 —— 上屏于是露出居中的「加载中」,下屏跳出「加载失败?按 A 重试」,
+ * 都不是真的。拉到暂存里、成功了才整体换上,翻页就只是某一帧换成新的一页。
+ * 20 条 x ~0.5KB,买得起;顺带让 B 取消变成真的无损。 */
+static BiliVideo s_stage[MAX_LIST];
+static int s_stage_n;
 static int  s_count = 0;
 static int  s_sel = 0;
 static float s_scroll = 0.0f;       /* 列表滚动偏移(显示值,像素) */
@@ -60,13 +68,17 @@ static float s_scroll_t = 0.0f;     /* 滚动目标值:输入写这里,显示值
 #define LIST_Y  26.0f               /* 列表区顶部(顶栏下方) */
 #define LIST_H  (240.0f - LIST_Y)
 static int  s_page = 1;
+/* 已知的最后一页(0 = 还不知道)。热门只有 22 页左右、收藏夹按实际条数,
+ * 而接口不会提前告诉你 —— 只能翻到空页那一下才知道。记住它,是为了
+ * 之后再按 R 不必再发一次注定为空的请求。换频道/换关键词要清零。 */
+static int  s_page_end = 0;
 static ListMode s_mode = MODE_RECOMMEND;   /* 默认进推荐(和官方 App 一致) */
 static int s_pending_mode = -1;   /* 登录界面里点了频道:退出后切过去 */
 static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=跟随 s_mode) */
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.1.0"
+#define APP_VERSION "1.2.0"
 
 /* ---------- 分 P ----------
  * 200 是务实的上限:课程/合集偶尔上百 P,再多就不该在掌机上翻了。
@@ -82,7 +94,17 @@ static const char *s_pg_labelp[MAX_PAGES];
 static int   s_pg_dur[MAX_PAGES];
 
 static bool g_danmaku = true;       /* 设置:弹幕开关 */
-static int  g_qn = 16;              /* 设置:清晰度 16=360P 32=480P */
+/* 清晰度。B 站的 qn 编号:16=360P 32=480P。
+ * 【别再加 240P(qn=6)】试过,撤了:**绝大多数视频根本不提供这一档**,
+ * 接口不会报错,而是默默返回 360P —— 设置页显示「240P」而实际是 360P,
+ * 用户只会觉得「选了没用」。一个大部分时候什么都不做的选项,
+ * 比没有这个选项更糟。相关的判断留在 log_quality 里(bili.c),
+ * 哪天 B 站放开了能一眼看出来。 */
+static int  g_qn = 16;
+#define QN_360 16
+#define QN_480 32
+static const char *qn_name(int qn) { return qn == QN_480 ? "480P" : "360P"; }
+static int qn_next(int qn) { return qn == QN_480 ? QN_360 : QN_480; }
 static bool g_force_sw = false;     /* 设置:强制软解 */
 static bool s_in_settings = false;  /* 当前在设置页 */
 static bool s_debug_ui = false;
@@ -96,18 +118,56 @@ static void set_status(const char *ui_utf8, const char *log_ascii) {
 }
 
 static void busy_frame(const char *msg);   /* 定义在下面 */
+static int  run_bg(int (*fn)(void *), void *arg, const char *msg);  /* 同上 */
+static bool s_job_cancelled;   /* 上一次 run_bg 是否被 B 掐掉,定义在下面 */
 
 /* 列表加载最多试几次(含第一次)。3 次、退避 0.8s+1.6s —— 再多就该让
  * 用户自己决定了:接口真的挂了的话,机器替他干等只是把失败拖得更久。 */
 #define LIST_RETRY_MAX 3
 
+/* 后台作业的参数。这几个调用都在主线程上串行发起,同一时刻只有一个
+ * 在跑,所以用文件作用域的变量传参最省事 —— 不必为每种作业各建一个结构。 */
+static const char *s_job_bvid;
+static int64_t s_job_cid;
+static char *s_job_url;
+static int s_job_qn;
+
+static int pagelist_job(void *u) {
+	(void)u;
+	return bili_pagelist(s_job_bvid, s_pages, MAX_PAGES, &s_npages);
+}
+static int playurl_job(void *u) {
+	(void)u;
+	return bili_get_play_url(s_job_bvid, s_job_cid, s_job_qn, s_job_url, 2048);
+}
+
+/* 列表拉取的实体。放到后台线程上跑,主线程照常画帧 —— 直接在主线程调
+ * 会冻住整整一秒(实测接口 0.8~1.1s),那一秒和死机分不出来。 */
+static int list_fetch_job(void *unused) {
+	(void)unused;
+	switch (s_mode) {
+	case MODE_SEARCH:  return bili_search(s_keyword, s_page, s_stage, MAX_LIST, &s_stage_n);
+	case MODE_RECOMMEND: return bili_recommend(s_page, s_stage, MAX_LIST, &s_stage_n);
+	case MODE_HISTORY: return bili_history(s_page, s_stage, MAX_LIST, &s_stage_n);
+	case MODE_FAV:     return bili_fav(s_page, s_stage, MAX_LIST, &s_stage_n);
+	default:           return bili_popular(s_page, s_stage, MAX_LIST, &s_stage_n);
+	}
+}
+
 static void load_list(void) {
+	/* 【末页信息收在这一处判定】换频道、换关键词、重新搜索……每条路径
+	 * 都会把 s_page 归 1,所以"回到第一页"就是"换了一批内容"的充要条件。
+	 * 分散到那 9 个赋值点各写一句,必然漏 —— 这一版就当场漏了两个
+	 * (ZL/ZR 切频道那两行是单行 if,和其他写法不一样)。
+	 * 同一条规矩写在多处、漏在某处,今天已经在线程回收上栽过一次了。 */
+	if (s_page == 1) s_page_end = 0;
 	set_status("加载中...", "loading...");
 	/* 【翻页时别清屏】先画一帧:**列表原样留着**,只在下屏状态条上提示。
 	 * 原来这里把整个上屏清成一句「加载中…」,翻一页闪一次白 ——
 	 * 而列表内容其实还在,清掉它只是让人以为东西没了。
 	 * 首次加载是例外(还没有列表可留),那时 draw_list 会居中显示 s_status。 */
-	busy_frame(s_count > 0 ? "加载新一页中..." : "加载中...");
+	const char *waiting = (s_count > 0) ? "加载新一页中" : "加载中";
+	busy_frame(waiting);
 
 	/* 【顺序要紧】先停封面,再发接口请求。
 	 * 反过来的话,换页时上一页的封面线程会和新的 API 请求并发 ——
@@ -123,24 +183,11 @@ static void load_list(void) {
 	 * 否则网络真断了就成了一个按不动的三秒卡顿。 */
 	int r = -1;
 	for (int attempt = 0; ; attempt++) {
-		switch (s_mode) {
-		case MODE_SEARCH:
-			r = bili_search(s_keyword, s_page, s_list, MAX_LIST, &s_count);
-			break;
-		case MODE_RECOMMEND:
-			r = bili_recommend(s_page, s_list, MAX_LIST, &s_count);
-			break;
-		case MODE_HISTORY:
-			r = bili_history(s_page, s_list, MAX_LIST, &s_count);
-			break;
-		case MODE_FAV:
-			r = bili_fav(s_page, s_list, MAX_LIST, &s_count);
-			break;
-		default:
-			r = bili_popular(s_page, s_list, MAX_LIST, &s_count);
-			break;
-		}
+		/* 翻页时不提示:列表原样留着,几百毫秒后换成新的一页就是了。
+		 * 首次加载没有列表可留,那时才需要一句「加载中」。 */
+		r = run_bg(list_fetch_job, NULL, waiting);
 		if (r == 0 || attempt >= LIST_RETRY_MAX - 1) break;
+		if (s_job_cancelled) break;   /* 用户主动取消:不是错误,别重试 */
 		if (net_is_shutting_down() || aptShouldClose()) break;
 
 		/* 退避 0.8s / 1.6s:两次之间不留间隔的话,失败往往只是重复一遍 */
@@ -160,10 +207,36 @@ static void load_list(void) {
 		if (give_up) break;
 	}
 
-	s_sel = 0;
-	s_scroll = 0.0f;
-	s_scroll_t = 0.0f;
-	if (r != 0) {
+	/* 【接口成功但一条都没有 = 到底了,不是出错】热门只有 22 页左右
+	 * (B 站自己的上限),收藏/历史/搜索同理。原来这里照样提交,于是
+	 * s_count 变 0:上屏空白、下屏跳「加载失败?按 A 重试」,而接口
+	 * 明明是好的 —— 用户按 A 重试多少次都是同一个空页。
+	 * 改成留住上一页并把页码退回去:再按一次翻页不会越走越远。 */
+	if (r == 0 && s_stage_n == 0 && s_count > 0) {
+		/* 退回来源那一页。空页只可能是 R 翻过头翻出来的(L 只会往回走,
+		 * 走到的都是有内容的页),所以减一就是用户刚才待着的地方。 */
+		if (s_page > 1) s_page--;
+		s_page_end = s_page;      /* 记下来,下次 R 直接挡掉 */
+		set_status("", "no more pages");
+		snprintf(s_busy, sizeof(s_busy), "已经是最后一页");
+		if (s_count > 0) thumb_start(s_list, s_count);
+		return;
+	}
+	if (r == 0) {
+		memcpy(s_list, s_stage, sizeof(s_list));
+		s_count = s_stage_n;
+	}
+	if (r == 0 || !s_job_cancelled) {
+		/* 取消时连滚动位置一起留着 —— 那才叫"当无事发生" */
+		s_sel = 0;
+		s_scroll = 0.0f;
+		s_scroll_t = 0.0f;
+	}
+	if (r != 0 && s_job_cancelled) {
+		/* 取消了就当无事发生:保留原来的列表,状态条清干净 */
+		set_status("", "load cancelled");
+		s_busy[0] = 0;
+	} else if (r != 0) {
 		s_count = 0;
 		char sbuf[160];
 		snprintf(sbuf, sizeof(sbuf), "加载失败 %s(A 重试 / B 返回)",
@@ -364,110 +437,85 @@ static void draw_bottom_list(bool touched, float tx, float ty, ListActions *act)
 		act->login = true;
 }
 
-/* 设置页上屏:当前设置一览。
- * 原来只有一个大字"设置"配一行说明,空着大半屏 —— 改成把下屏各选项的
- * **当前值**同步显示出来:点一下下屏,上屏立刻反映变化,比纯装饰有用。
- * 所有纵向尺寸都由 ui_text_height 推导,改字号不会挤成一团。 */
-static void draw_top_settings(void) {
-	const float W = 400.0f;
-	const float PAD = 16.0f;
-	float th_title = ui_text_height(UI_SHARP);
-	float th_row   = ui_text_height(UI_SHARP);
-	float th_tip   = ui_text_height(UI_SHARP);
+/* ---------- 设置页 ----------
+ * 下屏是可滚动列表,上屏是「你刚碰的那一项」的说明。
+ * 双屏机器上「下屏操作、上屏解释」是最自然的分工 —— 像「解码方式」
+ * 「画面比例」这类一句话说不清的选项,以前只能靠用户点了看效果去猜。
+ *
+ * 说明文字要**预先折好行**:上屏可用宽度 384px,汉字在清晰档约 18px 一个,
+ * 一行放得下 20 个左右。自动折行要按字宽逐字量,而这些文字是写死的,
+ * 写的时候折一次比每帧算一次划算。 */
+enum { SET_DANMAKU, SET_QN, SET_DECODE, SET_CACHE, SET_DEBUG, SET_BACK, SET_N };
 
-	/* 标题条 */
-	float hh = th_title + 14.0f;
-	ui_rect(0, 0, W, hh, UI_COL_ACCENT);
-	ui_text(PAD, (hh - th_title) / 2.0f, UI_SHARP, UI_COL_WHITE, "设置");
-	{
-		const char *brand = "3Danmu v" APP_VERSION;
-		float bw = ui_text_width(brand, UI_SHARP);
-		ui_text(W - PAD - bw, (hh - th_tip) / 2.0f, UI_SHARP, UI_COL_WHITE, brand);
-	}
-
-	char cache[40];
-	snprintf(cache, sizeof(cache), "%d MB", (int)(thumb_cache_kb() / 1024));
-	struct { const char *k; const char *v; } rows[] = {
-		{ "弹幕",     g_danmaku ? "开" : "关" },
-		{ "清晰度",   g_qn == 32 ? "480P" : "360P" },
-		{ "解码方式", g_force_sw ? "强制软解" : "自动(优先硬解)" },
-		{ "账号",     bili_logged_in() ? "已登录" : "未登录" },
-		{ "封面缓存", cache },
-	};
-	const int n = (int)(sizeof(rows) / sizeof(rows[0]));
-
-	float rh = th_row + 6.0f;    /* 收紧一点,给底部的声明行让位 */
-	float y  = hh + 10.0f;
-	for (int i = 0; i < n; i++) {
-		/* 隔行底色:分隔线在这个尺寸上太细,几乎看不出来,不如整行铺色 */
-		if (i & 1) ui_rect(PAD, y, W - PAD * 2, rh, UI_COL_SEL);
-		ui_rect(PAD, y, 3, rh, UI_COL_ACCENT);          /* 左侧色条 */
-		float ty2 = y + (rh - th_row) / 2.0f;
-		ui_text(PAD + 12, ty2, UI_SHARP, UI_COL_DIM, rows[i].k);
-		float vw = ui_text_width(rows[i].v, UI_SHARP);     /* 值右对齐 */
-		ui_text(W - PAD - 4 - vw, ty2, UI_SHARP, UI_COL_TEXT, rows[i].v);
-		y += rh + 2.0f;
-	}
-
-	/* 底部几行从下往上排,每加一行先确认它不会压到上面的表格 ——
-	 * 表格行数以后要是变了,这里会自动少画一行,而不是叠在一起。
-	 * (y 此刻正好是表格底部)
-	 * 版本号在右上角标题栏里已经有了(3Danmu vX.Y.Z),不重复占一行。 */
-	float ly = 240.0f - th_tip - 8.0f;
-	ui_text(PAD, ly, UI_SHARP, UI_COL_DIM, "下屏点按修改  /  B 返回");
-	ly -= th_tip + 4.0f;
-	/* 别再往这一行里塞字了:上屏可用宽度 384px,汉字在清晰档约 18px 一个,
-	 * 21 个字加空格就要溢出。真要加内容就再开一行(表格行高还能收)。 */
-	ui_text(PAD, ly, UI_SHARP, UI_COL_ACCENT,
-	        "仅供学习交流  严禁用于商业用途");
-	/* 作者。只留小红书号 —— 邮箱 22 个字符,加上标签就得单开一行,
-	 * 而这里纵向已经排到底了(见上面的「不压到表格才画」判断)。 */
-	ly -= th_tip + 4.0f;
-	if (ly > y + 2.0f)
-		ui_text(PAD, ly, UI_SHARP, UI_COL_DIM,
-		        "作者小红书 94133173379");
+static void settings_rows(UiRow *r, char *cachebuf, size_t cbn) {
+	if (thumb_cache_clearing())
+		/* 带上百分比:光一句「清理中…」分不出是在干活还是卡住了,
+		 * 而缓存里几千个文件时它本来就要转好一会儿 */
+		snprintf(cachebuf, cbn, "清理中 %d%%", thumb_cache_clear_pct());
+	else
+		snprintf(cachebuf, cbn, "清理 %dMB", (int)(thumb_cache_kb() / 1024));
+	r[SET_DANMAKU] = (UiRow){ "弹幕", g_danmaku ? "开" : "关",
+		"是否加载并显示弹幕。\n关掉可以省下加载时间和\n绘制开销。" };
+	r[SET_QN]      = (UiRow){ "清晰度", qn_name(g_qn),
+		"画面的分辨率。\n480P 更清晰,需要登录,\n也更吃解码性能。\n"
+		"取流失败会自动回落 360P。" };
+	r[SET_DECODE]  = (UiRow){ "解码方式", g_force_sw ? "强制软解" : "自动",
+		"自动 = 有硬件解码器就用它,\n失败自动退回软件解码。\n"
+		"软解 = 一律用 CPU 解码,\n兼容性最好,但慢很多。\n\n"
+		"通常保持「自动」即可。" };
+	r[SET_CACHE]   = (UiRow){ "封面缓存", cachebuf,
+		"列表封面存在 SD 卡上,\n下次遇到同一个视频就不用\n重新下载。\n"
+		"点一下清空;超过 100MB\n也会自动清。" };
+	r[SET_DEBUG]   = (UiRow){ "调试台", NULL,
+		"切到全屏日志页。\n记录最近 400 行:网络请求、\n解码状态、错误码。\n"
+		"出问题时把它拍下来,\n比任何文字描述都有用。\n手指拖动滚动,双击退出。" };
+	r[SET_BACK]    = (UiRow){ "返回", NULL, "回到视频列表。\nB 键同样可以。" };
 }
 
-static void draw_bottom_settings(bool touched, float tx, float ty) {
-	ui_begin_bottom();
-	ui_text(10, 5, UI_SHARP, UI_COL_TEXT, "设置");
-	if (ui_button(10, 32, 145, 40, g_danmaku ? "弹幕:开" : "弹幕:关",
-	              UI_COL_SEL, touched, tx, ty))
-		{ g_danmaku = !g_danmaku; settings_set("danmaku", g_danmaku); }
-	if (ui_button(165, 32, 145, 40, g_qn == 32 ? "清晰度:480P" : "清晰度:360P",
-	              UI_COL_SEL, touched, tx, ty))
-		{ g_qn = (g_qn == 32) ? 16 : 32; settings_set("qn", g_qn); }
-	if (ui_button(10, 80, 145, 40, g_force_sw ? "解码:软解" : "解码:自动",
-	              UI_COL_SEL, touched, tx, ty))
-		{ g_force_sw = !g_force_sw; settings_set("force_sw", g_force_sw); }
-	if (ui_button(165, 80, 145, 40, "调试台",
-	              UI_COL_SEL, touched, tx, ty))
-		s_debug_ui = true; /* 帧结束后再切,当帧内切会被 GPU 覆盖成花屏 */
+static void draw_settings(bool touched, bool holding, bool released,
+                          float tx, float ty) {
+	UiRow rows[SET_N];
+	char cachebuf[32];
+	settings_rows(rows, cachebuf, sizeof(cachebuf));
 
-	/* 封面缓存:按钮上直接显示占用,点一下清空。
-	 * 大小是缓存模块自己维护的运行值,不用每帧扫盘 */
-	{
-		static u64 cleared_at = 0;
-		char lbl[48];
-		if (cleared_at && osGetTime() - cleared_at < 1500)
-			snprintf(lbl, sizeof(lbl), "封面缓存:已清空");
-		else
-			snprintf(lbl, sizeof(lbl), "清理封面缓存 %dMB",
-			         (int)(thumb_cache_kb() / 1024));
-		if (ui_button(10, 128, 300, 40, lbl, UI_COL_SEL, touched, tx, ty)) {
-			thumb_cache_clear();
-			cleared_at = osGetTime();
-		}
-	}
+	/* 上屏:说明。没选中任何一项时给一段总览,别留空屏 */
+	int f = ui_list_focus();
+	const char *ttl = (f >= 0 && f < SET_N) ? rows[f].name : "设置";
+	const char *body = (f >= 0 && f < SET_N) ? rows[f].help
+	                 : "下屏点按修改。\n碰哪一项,这里就说明哪一项。";
+	char brand[48];
+	snprintf(brand, sizeof(brand), "3Danmu v%s   作者小红书 94133173379",
+	         APP_VERSION);
+	ui_help_draw(ttl, body, "仅供学习交流  严禁用于商业用途", brand);
 
-	/* 字号 -/+ 旋钮和 TARGET 读数已撤(v1.0.0 定稿)。它们是换字体时的
-	 * 标定工具,不是用户设置 —— 用户挪动 TARGET 只会把所有字挪出清晰点。
-	 * 下次换字体需要重标时,从 git 历史把这一段找回来,或直接看
-	 * trace.log 开机第一行的 sharp=../100(那个更准,还不用肉眼猜)。 */
-	if (ui_button(10, 176, 300, 40, "返回", UI_COL_SEL, touched, tx, ty))
+	if (ui_console_active()) return;   /* 调试台占着下屏 */
+	int hit = ui_list_draw("设置", rows, SET_N, touched, holding, released, tx, ty);
+	switch (hit) {
+	case SET_DANMAKU:
+		g_danmaku = !g_danmaku;
+		settings_set("danmaku", g_danmaku);
+		break;
+	case SET_QN:
+		g_qn = qn_next(g_qn);
+		settings_set("qn", g_qn);
+		break;
+	case SET_DECODE:
+		g_force_sw = !g_force_sw;
+		settings_set("force_sw", g_force_sw);
+		break;
+	case SET_CACHE:
+		/* 【异步】目录里可能有几万个文件,同步删会把界面冻住 */
+		thumb_cache_clear_async();
+		break;
+	case SET_DEBUG:
+		/* 帧结束后再切:当帧内切会被 GPU 覆盖成花屏 */
+		s_debug_ui = true;
+		break;
+	case SET_BACK:
 		s_in_settings = false;
-	ui_text(10, 222, UI_SHARP, UI_COL_DIM,
-	        "B 返回  /  缓存超 100MB 自动清空");
+		break;
+	default: break;
+	}
 }
 
 static void do_search(void) {
@@ -579,6 +627,67 @@ static void do_login(void) {
  * 会让人以为已经退出播放了 —— 何况一两秒后又跳回播放器,更乱。 */
 static bool s_busy_minimal = false;
 
+/* ---------- 把阻塞的网络调用挪出主线程 ----------
+ * 取列表、查分P、解析播放地址都是同步 HTTP,实测每次 0.8~1.1 秒。
+ * 直接在主线程上调,那一秒界面完全冻住 —— 连"正在做什么"的动画都不动,
+ * 和死机没法区分(这正是被反复反馈的"卡住")。
+ *
+ * 做法不是把整套流程改成异步(那要重写调用链),而是**把这一次调用
+ * 放到临时线程上,主线程原地转着画帧**。逻辑顺序完全不变,
+ * 调用方拿到的还是同一个返回值,只是期间界面活着。 */
+typedef struct {
+	int (*fn)(void *);
+	void *arg;
+	volatile int done;
+	int ret;
+} AsyncJob;
+
+static void async_job_thread(void *p) {
+	AsyncJob *j = (AsyncJob *)p;
+	j->ret = j->fn(j->arg);
+	__dmb();
+	j->done = 1;
+}
+
+/* 返回 fn 的返回值。建不出线程就退回同步调用 —— 慢一点也比不能用强。 */
+/* 上一次 run_bg 是不是被用户按 B 掐掉的。调用方据此决定「失败」要不要
+ * 报错、要不要重试 —— 主动取消不是错误,不该弹「加载失败」也不该自动重来。 */
+static int run_bg(int (*fn)(void *), void *arg, const char *msg) {
+	AsyncJob job = { fn, arg, 0, -1 };
+	/* 优先级比主线程低一档:它只是在等网络,不该和界面抢 */
+	Thread th = NULL;
+	static const int cores[] = { 2, 3, -2 };
+	for (int i = 0; i < 3 && !th; i++)
+		th = threadCreate(async_job_thread, &job, 16 * 1024, 0x31, cores[i], false);
+	if (!th) return fn(arg);
+	static const char *dots[4] = { "", ".", "..", "..." };
+	bool cancelling = false;
+	s_job_cancelled = false;
+	while (!job.done && aptMainLoop()) {
+		hidScanInput();
+		/* 【B 取消】httpc 的请求既没有超时也不看标志位,唯一能中断它的
+		 * 办法是从外面把连接掐掉 —— net_cancel_streams 就是干这个的
+		 * (挂起和退出路径本来就在用它,是条验证过的路)。
+		 * 掐完那个阻塞调用会很快带着错误返回,于是这个循环自然结束。 */
+		if (!cancelling && (hidKeysDown() & KEY_B)) {
+			cancelling = true;
+			s_job_cancelled = true;
+			net_cancel_streams();
+		}
+		char m[96];
+		/* 不换成「正在取消」:掐掉连接后阻塞调用几十毫秒内就带错误返回了,
+		 * 为这一瞬间换一句话,看着反倒像又开始干别的活。只收起 B 的提示 */
+		if (msg[0]) snprintf(m, sizeof(m), "%s%s%s",
+		                     msg, dots[(osGetTime() / 300) % 4],
+		                     cancelling ? "" : "   (B 取消)");
+		else m[0] = 0;      /* 空消息 = 界面照常,状态条不占用 */
+		busy_frame(m);
+		if (net_is_shutting_down() || aptShouldClose()) break;
+	}
+	thread_reap(&th, 10000000000ULL, "bg job");
+	return job.done ? job.ret : -1;
+}
+
 static void busy_frame(const char *msg) {
 	snprintf(s_busy, sizeof(s_busy), "%s", msg);
 	if (s_busy_minimal) {
@@ -647,14 +756,25 @@ static void play_stream(BiliVideo *v, int64_t cid, const char *disp_title) {
 	 * 其它请求都收摊之后,由播放器单独去拉(player.c 里 sub_kicked) */
 	sub_free();   /* 先清干净,杜绝上一个视频的残留 */
 	int used_qn = g_qn;
-  int r = bili_get_play_url(v->bvid, cid, g_qn, url, sizeof(url));
+	s_job_bvid = v->bvid; s_job_cid = cid; s_job_url = url;
+	s_job_qn = g_qn;
+	int r = run_bg(playurl_job, NULL, "解析播放地址");
 	/* 带上原因:光看 r=-1 分不出「没发请求」「请求失败」「接口拒绝」,
 	 * 而这三者的修法完全不同 */
 	ui_trace("playurl r=%d err=%s", r, bili_last_error());
-	if (r != 0 && g_qn != 16) { /* 高清晰度拿不到就回落 360P */
+	if (r != 0 && g_qn != QN_360) { /* 拿不到就回落 360P(最通用的一档) */
 		printf("qn=%d failed, fallback to 360P\n", g_qn);
-		r = bili_get_play_url(v->bvid, cid, 16, url, sizeof(url));
+		s_job_qn = QN_360;
+		r = run_bg(playurl_job, NULL, "解析播放地址(360P)");
 		used_qn = 16;
+	}
+	if (r != 0 && s_job_cancelled) {
+		/* 用户按 B 掐掉的:当作没点过这个视频,别弹错误 */
+		set_status("", "playurl cancelled");
+		s_busy[0] = 0;
+		dm_free();
+		sub_free();
+		return;
 	}
 	if (r != 0) {
 		{
@@ -670,9 +790,19 @@ static void play_stream(BiliVideo *v, int64_t cid, const char *disp_title) {
 		return;
 	}
 	player_set_meta(v->aid, cid, v->bvid);
+	/* 【每次开播都从存档重读弹幕开关】播放页里也能开关弹幕,而那个改动
+	 * 落在 player.c 的静态变量上,main.c 的 g_danmaku 并不知道。
+	 * 不重读的话,这里会拿一个过期的值把用户刚才的选择覆盖掉。
+	 * 存档是两处共同的真相来源,以它为准。 */
+	g_danmaku = settings_get("danmaku", g_danmaku ? 1 : 0) != 0;
 	player_set_prefs(g_danmaku, g_force_sw, used_qn);
 	s_busy[0] = 0;
 	player_play(url, disp_title);
+	/* 【回列表前把状态条擦掉】播放器开流时借 busy_frame 写过「连接中」
+	 * 「载入视频」,那几个字一直留在 s_busy 里 —— 播放期间被视频盖着看
+	 * 不见,退出来才露出来,于是列表底下挂着一句早就做完的事。
+	 * 状态条写的是"正在做什么",没在做就该是空的。 */
+	s_busy[0] = 0;
 	ui_trace_sync("exit-path: dm_free");
 	dm_free();
 	ui_trace_sync("exit-path: sub_free");
@@ -714,8 +844,8 @@ static void play_selected(void) {
 	 * 但问完就记在 v->pages 里,同一个视频再进来不会再问。 */
 	s_npages = 0;
 	if (v->pages != 1) {
-		busy_frame("检查分P...");
-		if (bili_pagelist(v->bvid, s_pages, MAX_PAGES, &s_npages) != 0)
+		s_job_bvid = v->bvid;
+		if (run_bg(pagelist_job, NULL, "检查分P") != 0)
 			s_npages = 0;
 		if (s_npages > 0) v->pages = s_npages;
 		s_busy[0] = 0;
@@ -754,6 +884,13 @@ static void play_selected(void) {
 			 * 不是「我要挑下一集」—— 以前播完无条件弹选集页,
 			 * 想走的人得按两次 B。 */
 			int pick = player_take_page_pick();
+			/* 【自动连播下一 P】看完一集自动接下一集,是合集/课程最自然的
+			 * 期待。但只在**自然播到片尾**时才接 —— 按 B 退出是「我不看了」,
+			 * 那时候把人带到下一集比不接更糟。 */
+			if (pick < 0 && player_ended_naturally() && cur + 1 < s_npages) {
+				pick = cur + 1;
+				ui_trace("自动连播:P%d → P%d", cur + 1, pick + 1);
+			}
 			if (pick < 0) break;
 			/* 系统要关我们:别再开下一段流了 */
 			if (net_is_shutting_down() || aptShouldClose()) break;
@@ -833,18 +970,23 @@ int main(void) {
 	}
 	ime_init();   /* 加载拼音词库(约 1MB,失败则输入退化为英文) */
 	player_set_login_cb(login_cb);
+	/* 开流阶段沿用列表页那一屏,状态写在状态条上(见 player.h) */
+	player_set_busy_cb(busy_frame);
 
-	/* 机型默认:New3DS 480P,老 3DS 360P + 软解(本就无 MVD) */
+	/* 机型默认:New3DS 480P(有 MVD 硬解),老 3DS 360P(只能软解) */
 	{
 		bool n3 = false;
 		APT_CheckNew3DS(&n3);
-		g_qn = n3 ? 32 : 16;
+		g_qn = n3 ? QN_480 : QN_360;
 	}
 	/* 存档覆盖默认值。顺序要在机型判断**之后**:清晰度的默认因机型而异,
 	 * settings_get 的 def 参数要拿到正确的机型默认 */
 	settings_init();
 	g_danmaku = settings_get("danmaku", g_danmaku ? 1 : 0) != 0;
-	g_qn      = (settings_get("qn", g_qn) == 32) ? 32 : 16;
+	{	/* 存档里可能留着已经撤掉的 240P(qn=6),按无效处理回落默认 */
+		int v = settings_get("qn", g_qn);
+		g_qn = (v == QN_480 || v == QN_360) ? v : g_qn;
+	}
 	g_force_sw = settings_get("force_sw", g_force_sw ? 1 : 0) != 0;
 	player_prefs_init();   /* 字幕开关/弹幕字号/字幕字号(存在 player.c) */
 
@@ -935,7 +1077,16 @@ int main(void) {
 			if (s_scroll - s_scroll_t < 0.5f && s_scroll_t - s_scroll < 0.5f)
 				s_scroll = s_scroll_t;
 		}
-		if (kDown & KEY_R) { s_page++; load_list(); }
+		if (kDown & KEY_R) {
+			if (s_page_end && s_page >= s_page_end) {
+				/* 已经知道到底了:不再发那次注定为空的请求。
+				 * 提示照给 —— 按了没反应比按了说"到底了"更让人困惑。 */
+				snprintf(s_busy, sizeof(s_busy), "已经是最后一页");
+			} else {
+				s_page++;
+				load_list();
+			}
+		}
 		if (kDown & KEY_L && s_page > 1) { s_page--; load_list(); }
 		if ((kDown & (KEY_ZL | KEY_ZR)) ||
 		    ((kDown & KEY_SELECT) && !(hidKeysHeld() & KEY_START))) {
@@ -983,17 +1134,18 @@ int main(void) {
 
 		if (s_in_settings) {
 			ui_begin();
-			draw_top_settings();
+			/* 松手帧 hidTouchRead 拿不到坐标,而点选正是在松手时判定的 ——
+			 * 这里把「按住」的坐标一路带进去,由列表自己记住最后一次 */
+			bool held_t = (hidKeysHeld() & KEY_TOUCH) != 0;
+			bool up_t = (hidKeysUp() & KEY_TOUCH) != 0;
+			touchPosition tps = { 0, 0 };
+			if (held_t) hidTouchRead(&tps);
+			draw_settings(touched, held_t, up_t, tps.px, tps.py);
 			if (ui_console_active()) {
-				touchPosition th;
-				hidTouchRead(&th);
-				bool held = (hidKeysHeld() & KEY_TOUCH) != 0;
-				if (ui_draw_log(touched, held, th.px, th.py)) {
+				if (ui_draw_log(touched, held_t, tps.px, tps.py)) {
 					s_debug_ui = false;
 					ui_bottom_debug(false);
 				}
-			} else {
-				draw_bottom_settings(touched, tp.px, tp.py);
 			}
 			ui_end();
 			if (s_debug_ui && !ui_console_active())
@@ -1026,7 +1178,7 @@ int main(void) {
 				load_list();
 			}
 		}
-		if (act.settings) s_in_settings = true;
+		if (act.settings) { s_in_settings = true; ui_list_reset(); }
 		if (act.popular) {
 			s_hl_mode = -1;
 			if (s_mode != MODE_POPULAR) { s_mode = MODE_POPULAR; s_page = 1; load_list(); }

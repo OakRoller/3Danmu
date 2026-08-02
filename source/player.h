@@ -18,6 +18,15 @@ void player_set_pages(const char *const *labels, const int *durations,
 /* 播放结束后问一次:用户在选集里挑了哪一 P(-1 = 没挑,正常退出)。
  * 取走即清。重新取流由 main.c 负责 —— 播放器不碰分P 的数据。 */
 int  player_take_page_pick(void);
+/* 上一次播放是不是自然播到片尾(而非 B 退出 / 换 P / 出错)。
+ * 多 P 视频据此决定要不要自动连播下一集。 */
+bool player_ended_naturally(void);
+
+/* 开流阶段(连接 / 载入)会阻塞几秒。播放器自己不知道该画什么界面 ——
+ * 那时候还没有画面,而列表页在 main.c 手里。所以由调用方注册一个
+ * 「画一帧忙碌状态」的回调:沿用原来那一屏,只在状态条上写在做什么。
+ * 不注册的话播放器退回自己画一句提示。 */
+void player_set_busy_cb(void (*cb)(const char *msg));
 
 /* 播放偏好(由设置页控制) */
 void player_set_prefs(bool danmaku_on, bool force_sw, int qn);
